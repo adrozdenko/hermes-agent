@@ -25,6 +25,9 @@
 #   - The gateway's API server is off unless you uncomment API_SERVER_KEY
 #     and API_SERVER_HOST. See docs/user-guide/api-server.md before doing
 #     this on an internet-facing host.
+#   - Bridge network mode is used for isolation. The dashboard port (9119)
+#     is bound to 127.0.0.1 only — access via SSH tunnel:
+#     ssh -L 9119:localhost:9119 user@your-server
 #
 services:
   gateway:
@@ -32,7 +35,8 @@ services:
     image: hermes-agent
     container_name: hermes
     restart: unless-stopped
-    network_mode: host
+    networks:
+      - hermes-net
     volumes:
       - ~/.hermes:/opt/data
     environment:
@@ -64,13 +68,21 @@ services:
     image: hermes-agent
     container_name: hermes-dashboard
     restart: unless-stopped
-    network_mode: host
+    networks:
+      - hermes-net
     depends_on:
       - gateway
+    ports:
+      - "127.0.0.1:9119:9119"
     volumes:
       - ~/.hermes:/opt/data
     environment:
       - HERMES_UID=${HERMES_UID:-10000}
       - HERMES_GID=${HERMES_GID:-10000}
-    # Localhost-only. For remote access, tunnel via `ssh -L 9119:localhost:9119`.
-    command: ["dashboard", "--host", "127.0.0.1", "--no-open"]
+    # Bound to loopback only. Access via SSH tunnel:
+    # ssh -L 9119:localhost:9119 user@your-server
+    command: ["dashboard", "--host", "0.0.0.0", "--no-open"]
+
+networks:
+  hermes-net:
+    driver: bridge
