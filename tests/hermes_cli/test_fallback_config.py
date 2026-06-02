@@ -1,7 +1,8 @@
 """Tests for hermes_cli/fallback_config.py — fallback entry API-key resolution."""
 
 from agent.secret_scope import reset_secret_scope, set_secret_scope
-from hermes_cli.fallback_config import effective_runtime_provider, resolve_entry_api_key
+from hermes_cli.fallback_config import effective_runtime_provider, get_fallback_chain, resolve_entry_api_key
+from hermes_cli.models import get_default_model_for_provider
 
 
 class TestResolveEntryApiKey:
@@ -65,3 +66,60 @@ class TestEffectiveRuntimeProvider:
 
     def test_none_inputs_are_safe(self):
         assert effective_runtime_provider(None, None) == ""
+
+
+class TestBareProviderStrings:
+    def test_bare_string_expands_to_default_model(self):
+        chain = get_fallback_chain({"fallback_providers": ["deepseek"]})
+        assert len(chain) == 1
+        assert chain[0]["provider"] == "deepseek"
+        assert chain[0]["model"] == get_default_model_for_provider("deepseek")
+        assert chain[0]["model"]  # non-empty
+
+    def test_top_level_bare_string(self):
+        chain = get_fallback_chain({"fallback_providers": "deepseek"})
+        assert len(chain) == 1
+        assert chain[0]["provider"] == "deepseek"
+
+    def test_unknown_bare_provider_is_dropped(self):
+        chain = get_fallback_chain({"fallback_providers": ["totally-unknown-xyz"]})
+        assert chain == []
+
+    def test_empty_string_is_dropped(self):
+        chain = get_fallback_chain({"fallback_providers": ["", "  "]})
+        assert chain == []
+
+
+class TestDictEntries:
+    def test_full_dict_passes_through(self):
+        entry = {"provider": "deepseek", "model": "deepseek-v4-pro"}
+        chain = get_fallback_chain({"fallback_providers": [entry]})
+        assert chain == [entry]
+
+    def test_dict_missing_model_gets_default(self):
+        chain = get_fallback_chain({"fallback_providers": [{"provider": "deepseek"}]})
+        assert len(chain) == 1
+        assert chain[0]["provider"] == "deepseek"
+        assert chain[0]["model"] == get_default_model_for_provider("deepseek")
+
+    def test_dict_missing_provider_is_dropped(self):
+        chain = get_fallback_chain({"fallback_providers": [{"model": "deepseek-v4-pro"}]})
+        assert chain == []
+
+
+class TestChainMerge:
+    def test_fallback_providers_beat_legacy_fallback_model(self):
+        chain = get_fallback_chain({
+            "fallback_providers": [{"provider": "deepseek", "model": "deepseek-v4-pro"}],
+            "fallback_model": {"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
+        })
+        assert [e["provider"] for e in chain] == ["deepseek", "openrouter"]
+
+    def test_duplicate_identity_is_deduped(self):
+        entry = {"provider": "deepseek", "model": "deepseek-v4-pro"}
+        chain = get_fallback_chain({
+            "fallback_providers": [entry],
+            "fallback_model": dict(entry),
+        })
+        assert len(chain) == 1
+

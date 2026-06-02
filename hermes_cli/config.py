@@ -1111,6 +1111,89 @@ def _validate_custom_providers(cp: Any, issues: List[ConfigIssue]) -> None:
                "legacy custom_providers entries are ignored until it is", _CP_LIST_HINT)
 
 
+
+def _validate_fallback_providers(fbp: Any, issues: List[ConfigIssue]) -> None:
+    """fallback_providers: list of dicts OR bare provider strings.
+
+    Bare strings ("deepseek") are expanded to the provider's default model by
+    get_fallback_chain(); warn when an entry can't resolve so silent drops are visible.
+    """
+    if isinstance(fbp, (dict, str)):
+        fbp_entries: list[Any] = [fbp]
+    elif isinstance(fbp, list):
+        fbp_entries = fbp
+    else:
+        _issue(
+            issues,
+            "warning",
+            f"fallback_providers should be a list, got {type(fbp).__name__} "
+            "— fallback will be disabled",
+            "Change to:\n"
+            "  fallback_providers:\n"
+            "    - provider: deepseek\n"
+            "      model: deepseek-v4-pro",
+        )
+        return
+
+    def _provider_has_default_model(provider: str) -> bool:
+        try:
+            from hermes_cli.models import get_default_model_for_provider
+
+            return bool((get_default_model_for_provider(provider) or "").strip())
+        except Exception:
+            return True
+
+    for i, entry in enumerate(fbp_entries):
+        if isinstance(entry, str):
+            provider = entry.strip()
+            if not provider:
+                _issue(
+                    issues,
+                    "warning",
+                    f"fallback_providers[{i}] is an empty string — it will be ignored",
+                    "Remove it or use a provider name, e.g.: - deepseek",
+                )
+            elif not _provider_has_default_model(provider):
+                _issue(
+                    issues,
+                    "warning",
+                    f"fallback_providers[{i}] '{provider}' has no known default model "
+                    "— the entry will be dropped and failover disabled",
+                    "Specify the model explicitly:\n"
+                    f"    - provider: {provider}\n"
+                    "      model: <model-name>",
+                )
+        elif isinstance(entry, dict):
+            provider = str(entry.get("provider") or "").strip()
+            if not provider:
+                _issue(
+                    issues,
+                    "warning",
+                    f"fallback_providers[{i}] is missing 'provider' field — it will be ignored",
+                    "Add: provider: deepseek (or another provider)",
+                )
+            elif (
+                not str(entry.get("model") or "").strip()
+                and not _provider_has_default_model(provider)
+            ):
+                _issue(
+                    issues,
+                    "warning",
+                    f"fallback_providers[{i}] '{provider}' is missing 'model' and has no "
+                    "known default — it will be ignored",
+                    "Add: model: <model-name>",
+                )
+        else:
+            _issue(
+                issues,
+                "warning",
+                f"fallback_providers[{i}] should be a provider name or a dict, "
+                f"got {type(entry).__name__} — it will be ignored",
+                "Use:  - deepseek   or   - provider: deepseek\n"
+                "                          model: deepseek-v4-pro",
+            )
+
+
 def _validate_fallback_model(fb: Any, issues: List[ConfigIssue]) -> None:
     """fallback_model: single dict OR list of dicts (chain)."""
     if isinstance(fb, list):
@@ -1207,7 +1290,12 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
     _validate_timezone(config, issues)
     cp = config.get("custom_providers")
     fb = config.get("fallback_model")
-    for value, validator in ((cp, _validate_custom_providers), (fb, _validate_fallback_model)):
+    fbp = config.get("fallback_providers")
+    for value, validator in (
+        (cp, _validate_custom_providers),
+        (fb, _validate_fallback_model),
+        (fbp, _validate_fallback_providers),
+    ):
         if value is not None:
             validator(value, issues)
 
