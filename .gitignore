@@ -304,3 +304,8 @@ native/fts5_cjk/*.so
 
 # Disposable profile created by scripts/probe_active_session_exclusivity.py
 .probe-home/
+
+# Real multi-tenant client registry — lives on the host, carries client names
+# and Telegram token refs. The repo is public; only clients.example.yaml is
+# versioned. See hermes_cli/clients.py.
+/clients.yaml
