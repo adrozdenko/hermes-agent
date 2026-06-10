@@ -1,0 +1,44 @@
+name: Create release tag
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  create-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create annotated tag v0.15.1-factory.1
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tag = 'v0.15.1-factory.1';
+            const sha = '15e5a79c12d14fbab492e13ac9e29f5516ecced3';
+            const message = [
+              'Bot-factory baseline: per-tenant proxy sandbox, tenant metering, tombstone-free boot',
+              '',
+              'Verified on Contabo via read-only diagnose run #5 (2026-06-10):',
+              '- sandboxed claude-proxy (image-baked) owns :11435',
+              '- no *.legacy service tombstones seeded',
+              '- /health reports workdir=/opt/data/proxy/workdir with tenant counters',
+            ].join('\n');
+
+            const tagObject = await github.rest.git.createTag({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag,
+              message,
+              object: sha,
+              type: 'commit',
+            });
+
+            await github.rest.git.createRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: `refs/tags/${tag}`,
+              sha: tagObject.data.sha,
+            });
+
+            core.info(`Created annotated tag ${tag} -> ${tagObject.data.sha} (commit ${sha})`);
