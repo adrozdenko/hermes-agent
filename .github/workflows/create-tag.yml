@@ -2,6 +2,9 @@ name: Create release tag
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - claude/tag-v0.15.1-factory.1-hs7243
 
 permissions:
   contents: write
