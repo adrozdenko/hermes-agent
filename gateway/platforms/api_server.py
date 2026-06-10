@@ -3131,7 +3131,7 @@ class APIServerAdapter(BasePlatformAdapter):
             if repeat is not None and (not isinstance(repeat, int) or repeat < 1):
                 return web.json_response({"error": "Repeat must be a positive integer"}, status=400)
 
-            kwargs = {
+            kwargs: Dict[str, Any] = {
                 "prompt": prompt,
                 "schedule": schedule,
                 "name": name,
