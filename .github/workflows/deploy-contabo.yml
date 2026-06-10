@@ -73,7 +73,16 @@ jobs:
             echo "proxy-migration: no volume claude-proxy to retire (already image-baked)"
           fi
 
-          docker compose -f /opt/hermes/docker-compose.yml up -d
+          # The prod override (docker-compose.prod.yml, from the app checkout)
+          # enforces per-tenant proxy auth: CLAUDE_PROXY_ALLOW_ANON=0 so a
+          # keyless request gets 401 instead of collapsing into a shared "anon"
+          # tenant. The public docker-compose.yml default stays anon-on for
+          # single-user setups. Every prod bot must already send its
+          # CLAUDE_PROXY_KEY (provisioned + auto-wired) or it will 401.
+          docker compose \
+            -f /opt/hermes/docker-compose.yml \
+            -f /opt/hermes/app/docker-compose.prod.yml \
+            up -d
 
           # ---- Post-deploy health gate ---------------------------------
           # A successful `up -d` only means the container was *created*, not
