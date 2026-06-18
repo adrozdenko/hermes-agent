@@ -20,8 +20,8 @@ def _run_two(worker):
     def wrap(name, *args):
         worker(name, barrier, results, *args)
 
-    t1 = threading.Thread(target=wrap, args=("a",) + (("KEY_A", "http://a", True),))
-    t2 = threading.Thread(target=wrap, args=("b",) + (("KEY_B", "http://b", False),))
+    t1 = threading.Thread(target=wrap, args=("a", "KEY_A", "http://a", True))
+    t2 = threading.Thread(target=wrap, args=("b", "KEY_B", "http://b", False))
     t1.start()
     t2.start()
     t1.join()
