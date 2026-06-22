@@ -331,3 +331,22 @@ def test_a_stopped_fleet_still_boots_nothing(tmp_path: Path) -> None:
 
     assert [a.action for a in actions] == ["registered"] * 3
     assert not any(a.folded_into_root for a in actions)
+
+
+def test_underscore_scaffold_dirs_are_skipped(tmp_path: Path) -> None:
+    """profiles/_template has SOUL.md but must not abort reconcile (#14)."""
+    scandir = tmp_path / "run-service"
+    scandir.mkdir()
+    scaffold = tmp_path / "profiles" / "_template"
+    scaffold.mkdir(parents=True)
+    (scaffold / "SOUL.md").write_text("# template\n", encoding="utf-8")
+    _make_profile(tmp_path, "coder", state="running")
+
+    actions = reconcile_profile_gateways(
+        hermes_home=tmp_path, scandir=scandir, dry_run=False,
+    )
+
+    names = [a.profile for a in actions]
+    assert "_template" not in names
+    assert "coder" in names
+

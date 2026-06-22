@@ -75,6 +75,18 @@ def _named_profile_dirs(hermes_home: Path) -> list[tuple[str, Path]]:
     for entry in sorted(profiles_root.iterdir()):
         if not entry.is_dir() or not (entry / "SOUL.md").exists():
             continue
+        # Skip scaffold/template dirs (leading underscore, e.g. '_template').
+        # They carry a SOUL.md but are not runnable profiles, and their names
+        # fail validate_profile_name — which would otherwise raise inside
+        # _register_service and abort the ENTIRE reconcile, leaving every
+        # later profile's gateway slot unregistered. Genuinely invalid names
+        # (e.g. uppercase) are NOT caught here and still surface as a hard error.
+        if entry.name.startswith("_"):
+            log.info(
+                "skipping scaffold dir profiles/%s (not a runnable profile)",
+                entry.name,
+            )
+            continue
         # "default" is reserved for the root profile slot.
         if entry.name == "default":
             log.warning("profiles/default/ exists — skipping to avoid colliding with the "
