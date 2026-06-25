@@ -8,7 +8,11 @@ import os
 import threading
 from pathlib import Path
 
-from agent.file_safety import get_read_block_error
+from agent.file_safety import (
+    get_read_block_error,
+    get_user_memory_block_error,
+    get_user_search_block_error,
+)
 from tools.binary_extensions import has_binary_extension
 from tools.file_operations import (
     ShellFileOperations,
@@ -635,6 +639,16 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
         if block_error:
             return json.dumps({"error": block_error})
 
+        # ── Per-tenant memory isolation ───────────────────────────────
+        # Multi-tenant profiles (e.g. Adelia) keep a private memory file
+        # per end user under <HERMES_HOME>/<profile>_users/<chat_id>.md.
+        # Refuse reads of another user's file / the user registry, scoped
+        # by the transport-authenticated chat_id. No-op for single-tenant
+        # profiles and for CLI/cron (no authenticated chat_id).
+        user_block = get_user_memory_block_error(str(_resolved))
+        if user_block:
+            return json.dumps({"error": user_block})
+
         # ── Dedup check ───────────────────────────────────────────────
         # If we already read this exact (path, offset, limit) and the
         # file hasn't been modified since, return a lightweight stub
@@ -977,6 +991,14 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         except Exception:
             _resolved = None
 
+        # Per-tenant memory isolation: refuse writing over another user's
+        # memory file (multi-tenant profiles). No-op otherwise. Checked on
+        # the resolved absolute path; falls back to the raw path if
+        # resolution failed.
+        user_block = get_user_memory_block_error(_resolved or path)
+        if user_block:
+            return tool_error(user_block)
+
         if _resolved is None:
             stale_warning = _check_file_staleness(path, task_id)
             file_ops = _get_file_ops(task_id)
@@ -1065,6 +1087,16 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             cross_warning = _check_cross_profile_path(_p, task_id)
             if cross_warning:
                 return tool_error(cross_warning)
+        # Per-tenant memory isolation: refuse patching another user's memory
+        # file (multi-tenant profiles). Resolve against the task cwd so a
+        # relative target under HERMES_HOME is classified correctly.
+        try:
+            _pr = str(_resolve_path_for_task(_p, task_id))
+        except Exception:
+            _pr = _p
+        user_block = get_user_memory_block_error(_pr)
+        if user_block:
+            return tool_error(user_block)
     try:
         # Resolve paths for locking.  Ordered + deduplicated so concurrent
         # callers lock in the same order — prevents deadlock on overlapping
@@ -1236,6 +1268,18 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 "pattern": pattern,
                 "already_searched": count,
             }, ensure_ascii=False)
+
+        # Per-tenant memory isolation: refuse tree searches that could scan
+        # other users' memory files or the registry (multi-tenant profiles).
+        # A scoped caller greping the profile root would otherwise read every
+        # user's file. No-op for single-tenant profiles, admin, and CLI/cron.
+        try:
+            _search_root = str(_resolve_path_for_task(path, task_id))
+        except Exception:
+            _search_root = path
+        search_block = get_user_search_block_error(_search_root)
+        if search_block:
+            return json.dumps({"error": search_block}, ensure_ascii=False)
 
         file_ops = _get_file_ops(task_id)
         result = file_ops.search(

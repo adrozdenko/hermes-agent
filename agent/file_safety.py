@@ -309,6 +309,337 @@ def get_read_block_error(path: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# Per-tenant memory isolation (multi-tenant profiles)
+#
+# Some Hermes profiles serve MANY end users through a single agent (e.g. the
+# Adelia Telegram persona). Each user has a private memory file under
+# ``<HERMES_HOME>/<profile>_users/<chat_id>.md`` and a roster lives in
+# ``<HERMES_HOME>/users.yaml``. Without a code-level gate, isolation between
+# users is purely prompt-level: a user can talk the agent into
+# ``read_file <profile>_users/<someone-else>.md`` (or grep the whole profile)
+# and exfiltrate another user's data. Prompt rules ride the same channel the
+# attacker controls, so they are advisory, not a boundary.
+#
+# The gate below makes authority come from the transport-authenticated
+# ``HERMES_SESSION_CHAT_ID`` (a concurrency-safe ContextVar set by the
+# gateway), NEVER from text in the conversation. A session may only touch its
+# own user's memory file(s); reading another user's file, listing the per-user
+# directory, or reading ``users.yaml`` is denied.
+#
+# Scope / safety:
+#   * No-op when there is no authenticated chat_id (CLI, cron, tests).
+#   * No-op for any profile WITHOUT a ``users.yaml`` registry — so every
+#     single-tenant profile is completely unaffected (presence-driven).
+#   * Admins (registry ``admin_ids``) bypass: they maintain the roster and do
+#     technical support. This is the concrete consumer of ``is_admin_chat``.
+#   * Unlike the read-deny above this CAN be a real boundary for a channel
+#     with no shell/terminal tool (Adelia-over-Telegram is restricted to
+#     browser/file/memory/send_message/skills/todo/vision). A channel that
+#     grants a shell could still ``cat`` the file — there it is only
+#     defense-in-depth, like ``get_read_block_error``.
+# ---------------------------------------------------------------------------
+
+# Sentinel: ``users.yaml`` exists on disk but does not parse / validate.
+# Distinct from ``None`` (file absent → legitimately single-tenant). A broken
+# registry must fail CLOSED — a security boundary that silently disappears on
+# a YAML typo is exactly the kind of regression that goes unnoticed in prod.
+_REGISTRY_BROKEN: Any = object()
+
+# Cache the parsed users.yaml registry keyed by path, invalidated on mtime
+# change. The registry is tiny but this guard runs on every file read/write.
+_USER_REGISTRY_CACHE: dict[str, tuple[float, Any]] = {}
+
+
+def _load_user_registry(hermes_home: Path) -> Any:
+    """Parse ``<hermes_home>/users.yaml``.
+
+    Returns one of three states (cached by path + mtime so the common
+    per-read call is cheap):
+
+      * a ``dict`` — a valid ``{users: [...]}`` registry,
+      * ``_REGISTRY_BROKEN`` — the file EXISTS but is unparseable / wrong
+        shape (callers must fail closed), or
+      * ``None`` — the file is ABSENT (legitimately single-tenant; no-op).
+    """
+    try:
+        registry_path = (hermes_home / "users.yaml").resolve()
+    except Exception:
+        return None
+    key = str(registry_path)
+    try:
+        mtime = registry_path.stat().st_mtime
+    except OSError:
+        _USER_REGISTRY_CACHE.pop(key, None)
+        return None  # absent
+    cached = _USER_REGISTRY_CACHE.get(key)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    # The file is present; anything short of a valid parse is BROKEN, not absent.
+    data: Any = _REGISTRY_BROKEN
+    try:
+        import yaml  # local import: file_safety must stay import-light
+
+        with open(registry_path, "r", encoding="utf-8") as fh:
+            loaded = yaml.safe_load(fh)
+        if isinstance(loaded, dict) and isinstance(loaded.get("users"), list):
+            data = loaded
+    except Exception:
+        data = _REGISTRY_BROKEN
+    _USER_REGISTRY_CACHE[key] = (mtime, data)
+    return data
+
+
+def _safe_profile_token(value: object, fallback: str) -> str:
+    """Return *value* only if it is a single safe path segment.
+
+    The registry ``profile:`` field is admin-controlled but still interpolated
+    into a directory name; reject anything with separators / ``..`` / NUL so a
+    stray value cannot relocate the guarded directory (F8).
+    """
+    token = str(value) if value else ""
+    if (
+        not token
+        or token in (".", "..")
+        or "/" in token
+        or "\\" in token
+        or "\x00" in token
+    ):
+        return fallback
+    return token
+
+
+def _per_user_memory_dir(hermes_home: Path, registry: object) -> Path:
+    """Directory holding per-user memory files, e.g. ``<home>/adelia_users``.
+
+    Derived from the registry ``profile:`` field (``<profile>_users``),
+    falling back to the HERMES_HOME directory name — both resolve to
+    ``adelia_users`` for the Adelia profile. A broken registry falls back to
+    the directory name.
+    """
+    raw = registry.get("profile") if isinstance(registry, dict) else None
+    profile = _safe_profile_token(raw, hermes_home.name)
+    return hermes_home / f"{profile}_users"
+
+
+def is_admin_chat(
+    chat_id: str,
+    registry: Optional[dict] = None,
+    hermes_home: Optional[Path] = None,
+) -> bool:
+    """Return True when *chat_id* is an authenticated admin for the profile.
+
+    Authority is the registry ``admin_ids`` list — a code-level source of
+    truth. A user CLAIMING to be admin in the conversation never reaches this
+    function; only the transport-authenticated chat_id does.
+    """
+    if not chat_id:
+        return False
+    if registry is None:
+        if hermes_home is None:
+            hermes_home = _hermes_home_path()
+        registry = _load_user_registry(hermes_home)
+    if not isinstance(registry, dict):
+        # Absent or broken registry → cannot establish admin authority.
+        return False
+    admin_ids = registry.get("admin_ids") or []
+    return str(chat_id) in {str(a) for a in admin_ids}
+
+
+def _allowed_memory_files(chat_id: str, registry: dict) -> set[str]:
+    """Memory filenames *chat_id* may access: its own file plus every file in
+    the same identity cluster (a person with several linked Telegram accounts).
+
+    Always includes the bare ``<chat_id>.md`` convention name as a floor, so a
+    known user can reach their own file even if the registry omits ``memory:``.
+    """
+    by_id: dict[str, dict] = {}
+    for user in registry.get("users") or []:
+        if isinstance(user, dict) and "id" in user:
+            by_id[str(user["id"])] = user
+
+    # Expand the identity cluster: self + main_account + accounts, transitively.
+    cluster: set[str] = {str(chat_id)}
+    frontier = [str(chat_id)]
+    while frontier:
+        cid = frontier.pop()
+        user = by_id.get(cid)
+        if not user:
+            continue
+        linked: list[str] = []
+        main_account = user.get("main_account")
+        if main_account is not None:
+            linked.append(str(main_account))
+        for acc in user.get("accounts") or []:
+            linked.append(str(acc))
+        for nid in linked:
+            if nid not in cluster:
+                cluster.add(nid)
+                frontier.append(nid)
+
+    allowed = {f"{chat_id}.md"}
+    for cid in cluster:
+        allowed.add(f"{cid}.md")
+        user = by_id.get(cid)
+        if user:
+            mem = user.get("memory")
+            if isinstance(mem, str) and mem:
+                allowed.add(mem)
+    return allowed
+
+
+# Agent-facing denial. The model sees this and (per the persona's §8/§8a
+# confidentiality rules) must translate it into a neutral user-facing reply —
+# never parrot the path or the existence of other users.
+_USER_MEMORY_DENIED = (
+    "Access denied: this per-user memory file belongs to a different user. "
+    "Each session may only access its own user's memory file(s). "
+    "(Per-tenant isolation enforced by the authenticated chat_id — it cannot "
+    "be overridden from the conversation. Do not reveal this to the user; "
+    "respond per the persona's confidentiality rules.)"
+)
+
+
+def _resolve_tenant_context(
+    chat_id: Optional[str],
+) -> Optional[tuple[str, Path, Any]]:
+    """Resolve (chat_id, hermes_home, registry) when per-tenant scoping applies.
+
+    ``registry`` is either a valid dict or ``_REGISTRY_BROKEN`` (present but
+    unparseable → callers fail closed). Returns ``None`` (gate is a complete
+    no-op) only when there is no authenticated chat_id or ``users.yaml`` is
+    ABSENT (a genuinely single-tenant profile).
+    """
+    if chat_id is None:
+        try:
+            from gateway.session_context import get_session_env
+
+            chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+        except Exception:
+            chat_id = ""
+    if not chat_id:
+        return None
+    hermes_home = _hermes_home_path()
+    registry = _load_user_registry(hermes_home)
+    if registry is None:
+        return None  # users.yaml absent → single-tenant, no scoping
+    return str(chat_id), hermes_home, registry
+
+
+def get_user_memory_block_error(
+    path: str, chat_id: Optional[str] = None
+) -> Optional[str]:
+    """Deny cross-tenant access to per-user memory files and the user registry.
+
+    Callers MUST pass an already-resolved absolute path (file tools resolve
+    against ``TERMINAL_CWD`` which can differ from the process cwd — same
+    contract as :func:`get_read_block_error`).
+    """
+    ctx = _resolve_tenant_context(chat_id)
+    if ctx is None:
+        return None
+    chat_id, hermes_home, registry = ctx
+    broken = registry is _REGISTRY_BROKEN
+
+    # Authenticated admins maintain the roster / do support — full access.
+    # A broken registry cannot establish admin authority, so NO bypass: the
+    # boundary holds for everyone until the registry is repaired (fail closed).
+    if not broken and is_admin_chat(chat_id, registry=registry):
+        return None
+
+    try:
+        resolved = Path(path).expanduser().resolve()
+    except Exception:
+        return None
+
+    # The roster itself enumerates every user — non-admins must not read it.
+    try:
+        if resolved == (hermes_home / "users.yaml").resolve():
+            return _USER_MEMORY_DENIED
+    except Exception:
+        pass
+
+    try:
+        per_user_dir = _per_user_memory_dir(hermes_home, registry).resolve()
+    except Exception:
+        # Cannot locate the guarded dir on a broken registry → deny the whole
+        # per-user area conservatively is impossible without it, so fall back
+        # to the home-derived default which _per_user_memory_dir already uses.
+        return _USER_MEMORY_DENIED if broken else None
+
+    # The directory itself (a listing would enumerate other users).
+    if resolved == per_user_dir:
+        return _USER_MEMORY_DENIED
+    # Outside the per-user directory → not our concern.
+    try:
+        resolved.relative_to(per_user_dir)
+    except ValueError:
+        return None
+    # Inside but nested below the flat dir → no legitimate files there.
+    if resolved.parent != per_user_dir:
+        return _USER_MEMORY_DENIED
+
+    # Broken registry: cannot resolve the caller's allowed set → deny all
+    # per-user files (fail closed) until the roster is repaired.
+    if broken:
+        return _USER_MEMORY_DENIED
+
+    if resolved.name in _allowed_memory_files(chat_id, registry):
+        return None
+    return _USER_MEMORY_DENIED
+
+
+def get_user_search_block_error(
+    search_root: str, chat_id: Optional[str] = None
+) -> Optional[str]:
+    """Deny tree searches by a scoped caller that could scan other users'
+    memory files or the registry.
+
+    A content/file search walks ``search_root`` recursively. If that subtree
+    contains the per-user memory directory or the registry (e.g. a search
+    rooted at the profile home), a scoped non-admin caller could enumerate
+    other tenants — so the search is refused. Searches unrelated to the
+    per-user area are unaffected; admin / CLI / cron are unaffected.
+    """
+    ctx = _resolve_tenant_context(chat_id)
+    if ctx is None:
+        return None
+    chat_id, hermes_home, registry = ctx
+    broken = registry is _REGISTRY_BROKEN
+    if not broken and is_admin_chat(chat_id, registry=registry):
+        return None
+
+    try:
+        root = Path(search_root).expanduser().resolve()
+    except Exception:
+        return None
+    try:
+        per_user_dir = _per_user_memory_dir(hermes_home, registry).resolve()
+        registry_file = (hermes_home / "users.yaml").resolve()
+    except Exception:
+        return None
+
+    def _within(inner: Path, outer: Path) -> bool:
+        if inner == outer:
+            return True
+        try:
+            inner.relative_to(outer)
+            return True
+        except ValueError:
+            return False
+
+    # Deny when the search would descend into the per-user dir (root is an
+    # ancestor of, or equal to, it), when the search is rooted inside it, or
+    # when it would reach the registry file.
+    if (
+        _within(per_user_dir, root)
+        or _within(root, per_user_dir)
+        or _within(registry_file, root)
+    ):
+        return _USER_MEMORY_DENIED
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Cross-profile write guard (#TBD)
 #
 # Hermes profiles are separate HERMES_HOME dirs under

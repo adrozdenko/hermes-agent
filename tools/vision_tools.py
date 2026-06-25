@@ -630,6 +630,18 @@ async def _vision_analyze_native(
         local_path = Path(os.path.expanduser(resolved_url))
 
         if local_path.is_file():
+            # Defense-in-depth: vision reads file bytes directly, bypassing the
+            # file_tools read path. Route local images through the same guards
+            # so a credential store or another tenant's memory file can't be
+            # exfiltrated as an "image" (F2).
+            from agent.file_safety import (
+                get_read_block_error,
+                get_user_memory_block_error,
+            )
+            _abs = str(local_path.resolve())
+            _vblock = get_read_block_error(_abs) or get_user_memory_block_error(_abs)
+            if _vblock:
+                return tool_error(_vblock, success=False)
             temp_image_path = local_path
             should_cleanup = False
         elif _validate_image_url(image_url):
@@ -768,7 +780,18 @@ async def vision_analyze_tool(
             resolved_url = resolved_url[len("file://"):]
         local_path = Path(os.path.expanduser(resolved_url))
         if local_path.is_file():
-            # Local file path (e.g. from platform image cache) -- skip download
+            # Local file path (e.g. from platform image cache) -- skip download.
+            # Route through the read/tenant guards first: vision reads bytes
+            # directly, so without this a credential store or another tenant's
+            # memory file could be exfiltrated as an "image" (F2).
+            from agent.file_safety import (
+                get_read_block_error,
+                get_user_memory_block_error,
+            )
+            _abs = str(local_path.resolve())
+            _vblock = get_read_block_error(_abs) or get_user_memory_block_error(_abs)
+            if _vblock:
+                raise PermissionError(_vblock)
             logger.info("Using local image file: %s", image_url)
             temp_image_path = local_path
             should_cleanup = False  # Don't delete cached/local files
@@ -1271,6 +1294,17 @@ async def video_analyze_tool(
         local_path = Path(os.path.expanduser(resolved_url))
 
         if local_path.is_file():
+            # Defense-in-depth: route local video reads through the read +
+            # tenant guards too, so a per-user memory file / credential store
+            # can't be exfiltrated via the video path (F2 — same as images).
+            from agent.file_safety import (
+                get_read_block_error,
+                get_user_memory_block_error,
+            )
+            _abs = str(local_path.resolve())
+            _vblock = get_read_block_error(_abs) or get_user_memory_block_error(_abs)
+            if _vblock:
+                raise PermissionError(_vblock)
             logger.info("Using local video file: %s", video_url)
             temp_video_path = local_path
             should_cleanup = False
