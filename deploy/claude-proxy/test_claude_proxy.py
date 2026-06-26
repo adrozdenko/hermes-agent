@@ -481,6 +481,35 @@ def test_classify_override_tilde(monkeypatch):
     assert cp.classify_model("~haiku do a thing") == "haiku"
 
 
+# ── Tier floor (CLAUDE_PROXY_MIN_TIER) ──
+
+def test_min_tier_floors_haiku_to_sonnet(monkeypatch):
+    monkeypatch.setattr(cp, "MIN_TIER", "sonnet")
+    assert cp.apply_min_tier("haiku") == "sonnet"     # lifted
+    assert cp.apply_min_tier("sonnet") == "sonnet"    # unchanged
+    assert cp.apply_min_tier("opus") == "opus"        # never lowered
+
+
+def test_min_tier_unset_is_noop(monkeypatch):
+    monkeypatch.setattr(cp, "MIN_TIER", "")
+    assert cp.apply_min_tier("haiku") == "haiku"
+    assert cp.apply_min_tier("opus") == "opus"
+
+
+def test_min_tier_opus_floor(monkeypatch):
+    monkeypatch.setattr(cp, "MIN_TIER", "opus")
+    assert cp.apply_min_tier("haiku") == "opus"
+    assert cp.apply_min_tier("sonnet") == "opus"
+    assert cp.apply_min_tier("opus") == "opus"
+
+
+def test_min_tier_unknown_tier_defaults_to_sonnet_rank(monkeypatch):
+    # An unexpected tier string is treated as sonnet-rank, so a sonnet floor
+    # leaves it alone (never accidentally lowers it to the floor word).
+    monkeypatch.setattr(cp, "MIN_TIER", "sonnet")
+    assert cp.apply_min_tier("claude-sonnet-4-6") == "claude-sonnet-4-6"
+
+
 # ── Phase 4: Anthropic backend response → claude result shape ──
 
 def test_anthropic_backend_shape():
