@@ -100,6 +100,31 @@ TIER_MODEL_MAP = {
     "opus": os.environ.get("ANTHROPIC_MODEL_OPUS", "claude-opus-4-8"),
 }
 
+# Optional minimum tier floor ("haiku" < "sonnet" < "opus"). When set (e.g.
+# CLAUDE_PROXY_MIN_TIER=sonnet) the classifier may still escalate UP to opus,
+# but a request is never routed BELOW the floor — so a coding client on this
+# proxy can't silently land on haiku for a casually-worded but hard task.
+# Unset (default) = no floor, so other deployments are unaffected.
+_TIER_RANK = {"haiku": 0, "sonnet": 1, "opus": 2}
+MIN_TIER = os.environ.get("CLAUDE_PROXY_MIN_TIER", "").strip().lower()
+if MIN_TIER and MIN_TIER not in _TIER_RANK:
+    print(f"[proxy] ignoring invalid CLAUDE_PROXY_MIN_TIER={MIN_TIER!r}")
+    MIN_TIER = ""
+
+
+def apply_min_tier(tier: str) -> str:
+    """Raise *tier* to the configured floor (CLAUDE_PROXY_MIN_TIER), if any.
+
+    No-op when MIN_TIER is unset or when *tier* already meets/exceeds it.
+    Opus and any tier at/above the floor pass through unchanged.
+    """
+    if not MIN_TIER:
+        return tier
+    if _TIER_RANK.get(tier, _TIER_RANK["sonnet"]) < _TIER_RANK[MIN_TIER]:
+        return MIN_TIER
+    return tier
+
+
 # DeepSeek API routing — take over for large text-only prompts (>threshold chars,
 # no images) where Claude Code's subprocess-based path crashes.  Direct HTTP call
 # to api.deepseek.com/v1, no internal turns, no subprocess — stable at 200K+ chars.
@@ -1541,7 +1566,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
             tier = "sonnet"
         else:
             tier = classify_model(prompt)
-        print(f"[proxy] {'explicit' if any(t in model_name.lower() for t in ['opus', 'haiku', 'sonnet']) else 'images' if images else 'auto'}: {tier} | tenant={tenant} | prompt: {prompt[:80]}...")
+        # Enforce the configured floor last, so it lifts every routing path
+        # (auto-classified, image, or explicit) but never lowers an opus pick.
+        _pre_floor = tier
+        tier = apply_min_tier(tier)
+        _floor_note = f" (floored from {_pre_floor})" if tier != _pre_floor else ""
+        print(f"[proxy] {'explicit' if any(t in model_name.lower() for t in ['opus', 'haiku', 'sonnet']) else 'images' if images else 'auto'}: {tier}{_floor_note} | tenant={tenant} | prompt: {prompt[:80]}...")
 
         request_count += 1
 
