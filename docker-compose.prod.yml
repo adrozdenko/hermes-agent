@@ -31,6 +31,11 @@ services:
       # default) can't land on haiku for a hard task that's casually worded.
       # Client bots are DeepSeek-direct and unaffected.
       - CLAUDE_PROXY_MIN_TIER=sonnet
+      # Bind the proxy on the docker network (not just loopback) so an isolated
+      # client container (tats) on the same network can reach it. Still keyed
+      # (ALLOW_ANON=0) + per-tenant budgeted; reachable only by containers on
+      # hermes-net, never the host/internet (no 11435 port mapping).
+      - CLAUDE_PROXY_HOST=0.0.0.0
       # Fleet broker endpoint. The prod containers run on a BRIDGE network, so
       # the host's sshd is NOT at the container's 127.0.0.1 — it's at the
       # docker host-gateway address, surfaced as host.docker.internal via the
