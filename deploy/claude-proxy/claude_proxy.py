@@ -56,6 +56,11 @@ def _resolve_claude_bin() -> str:
 CLAUDE_BIN = _resolve_claude_bin()
 HOME = "/opt/data/home"
 PORT = int(os.environ.get("CLAUDE_PROXY_PORT", "11435"))
+# Bind host. Defaults to loopback so existing single-container deployments are
+# unchanged. Set CLAUDE_PROXY_HOST=0.0.0.0 to let an isolated client container
+# on the same docker network reach the proxy (keyed auth still applies — never
+# expose without CLAUDE_PROXY_ALLOW_ANON=0).
+HOST = os.environ.get("CLAUDE_PROXY_HOST", "127.0.0.1")
 # Move the proxy's working directory off the shared data volume so a sandboxed
 # claude -p has no incidental cwd access to tenant data.
 WORKDIR = os.environ.get("CLAUDE_PROXY_WORKDIR", "/opt/data/proxy/workdir")
@@ -1660,12 +1665,12 @@ def main():
           f"(threshold={BREAKER_THRESHOLD} window={BREAKER_WINDOW}s cooldown={BREAKER_COOLDOWN}s)")
 
     try:
-        server = ThreadingHTTPServer(("127.0.0.1", PORT), ProxyHandler)
+        server = ThreadingHTTPServer((HOST, PORT), ProxyHandler)
     except OSError as e:
-        print(f"[proxy] FATAL: cannot bind to port {PORT}: {e}", flush=True)
+        print(f"[proxy] FATAL: cannot bind to {HOST}:{PORT}: {e}", flush=True)
         sys.exit(1)
 
-    print(f"Proxy ready (threaded): http://127.0.0.1:{PORT}/v1/chat/completions")
+    print(f"Proxy ready (threaded): http://{HOST}:{PORT}/v1/chat/completions")
 
     try:
         server.serve_forever()
