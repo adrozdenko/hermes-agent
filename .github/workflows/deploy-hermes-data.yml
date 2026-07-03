@@ -327,23 +327,18 @@ jobs:
           text = path.read_text(encoding='utf-8')
           new = 'Для будь-якої SMM-роботи спочатку завантажуй skill `salon-content-pack`, а далі його ланцюжок: `instagram-visual-workflow`, `adelia-brand-system`, `beauty-story-copy`, `cyrillic-story-typography`, `salon-photo-style-system`, `salon-post-image-generation` та `salon-story-visual-design` залежно від задачі. Уся робота має бути організована в `/opt/data/work/smm/YYYY-MM-DD/<project>/`: brief, drafts, sources, exports, references, manifest. Не розкидай файли напряму в `/opt/data`; це допустимо лише для тимчасових upload/cache файлів, які потім треба скопіювати в workspace. Для сторіс/постів із текстом SVG — основний production source (`story.svg`, `post.svg`, `carousel-01.svg`), бо він дає контроль над шрифтами, ритмом, spacing, графічними елементами й експортом. HTML використовуй тільки коли він справді потрібен, але фінал усе одно PNG/JPG. Фінальний макет не повинен містити placeholder-текст, випадкові іконки, декоративні лінії без сенсу або графіку, яка перекриває обличчя/волосся. Кирилиця — пріоритет: обирай тільки перевірені Cyrillic-safe шрифтові пари, тримай стабільний ритм, line-height, відступи й ієрархію. Кожен макет має використовувати Adelia brand tokens: palette, fonts, spacing, overlays, CTA/footer, і ці tokens треба записати в brief. Реальні фото обробляй в одному стилі, збережи правдиві тони шкіри й волосся. Згенеровані зображення для постів мають бути brand-safe, copyright-safe і в одному стилі з поточними Adelia tokens.'
           marker = 'Для будь-якої SMM-роботи'
-          next_marker = '
-
-          Якщо під час створення сторіс/поста'
+          next_marker = '\n\nЯкщо під час створення сторіс/поста'
+          blank_marker = '\n\n'
           start = text.find(marker)
           if start >= 0:
               end = text.find(next_marker, start)
               if end < 0:
-                  end = text.find('
-
-          ', start)
+                  end = text.find(blank_marker, start)
               if end < 0:
                   end = len(text)
               text = text[:start] + new + text[end:]
           else:
-              text = text.rstrip() + '
-
-          ' + new + '
+              text = text.rstrip() + blank_marker + new + '
           '
           path.write_text(text, encoding='utf-8')
           PYEOF
