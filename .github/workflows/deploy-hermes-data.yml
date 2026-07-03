@@ -7,7 +7,7 @@ jobs:
   deploy-data:
     runs-on: ubuntu-latest
     steps:
-      - name: Pull live hermes-data checkout and restart Adelia
+      - name: Ship Adelia SMM skill payload and restart
         env:
           SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
           HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
@@ -22,22 +22,153 @@ jobs:
               -i ~/.ssh/id_ed25519 root@5.189.159.195 'bash -se' <<'REMOTE'
           set -euxo pipefail
 
+          PAYLOAD_B64=/tmp/adelia-instagram-visual-workflow.tgz.b64
+          PAYLOAD=/tmp/adelia-instagram-visual-workflow.tgz
+          cat > "$PAYLOAD_B64" <<'B64'
+          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
+          X6sf9hgAfAAA
+          B64
+          base64 -d "$PAYLOAD_B64" > "$PAYLOAD"
+
           patch_soul() {
             root="$1"
             soul="$root/profiles/adelia/SOUL.md"
             [ -f "$soul" ] || return 0
             if ! grep -q 'export_visual.py' "$soul"; then
-              printf '\n%s\n' 'Якщо під час створення сторіс/поста системний Chromium або браузерний скріншот недоступний, це не фінальний результат і не причина віддавати лише HTML. Не кажи користувачу «Chromium немає» як завершення задачі. Створи фінальний SVG-макет у workspace і конвертуй його у PNG через `/opt/data/skills/smm/instagram-visual-workflow/scripts/export_visual.py`. Тільки якщо браузерний шлях і SVG->PNG fallback обидва провалилися, коротко назви точну технічну помилку.' >> "$soul"
+              printf '
+          %s
+          ' 'Якщо під час створення сторіс/поста системний Chromium або браузерний скріншот недоступний, це не фінальний результат і не причина віддавати лише HTML. Не кажи користувачу «Chromium немає» як завершення задачі. Створи фінальний SVG-макет у workspace і конвертуй його у PNG через `/opt/data/skills/smm/instagram-visual-workflow/scripts/export_visual.py`. Тільки якщо браузерний шлях і SVG->PNG fallback обидва провалилися, коротко назви точну технічну помилку.' >> "$soul"
             fi
           }
 
-          update_root() {
+          deploy_root() {
             root="$1"
-            [ -d "$root" ] || return 1
-            [ -d "$root/.git" ] || return 1
-            git config --global --add safe.directory "$root" || true
-            git -C "$root" fetch origin master
-            git -C "$root" checkout origin/master -- skills/smm/instagram-visual-workflow
+            [ -d "$root" ] || return 0
+            rm -rf "$root/skills/smm/instagram-visual-workflow"
+            tar -xzf "$PAYLOAD" -C "$root"
             chmod +x "$root/skills/smm/instagram-visual-workflow/scripts/export_visual.py"
 
             if [ -d "$root/skills/instagram-visual-workflow" ]; then
@@ -49,11 +180,9 @@ jobs:
             patch_soul "$root"
           }
 
-          UPDATED=0
-          update_root /opt/hermes/clients/adelia && UPDATED=1 || true
-          update_root /opt/data && UPDATED=1 || true
-          test "$UPDATED" = 1
+          deploy_root /opt/hermes/clients/adelia
 
+          test -x /opt/hermes/clients/adelia/skills/smm/instagram-visual-workflow/scripts/export_visual.py
           docker ps -a --format '{{.Names}} {{.Status}}' | grep -E 'hermes|adelia' || true
           docker exec hermes-adelia sh -lc 'python3 -m py_compile /opt/data/skills/smm/instagram-visual-workflow/scripts/export_visual.py && test -x /opt/data/skills/smm/instagram-visual-workflow/scripts/export_visual.py && grep -q export_visual.py /opt/data/profiles/adelia/SOUL.md'
           docker exec hermes-adelia /command/s6-svc -t /run/service/gateway-default
