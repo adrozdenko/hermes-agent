@@ -7,7 +7,7 @@ jobs:
   deploy-data:
     runs-on: ubuntu-latest
     steps:
-      - name: Pull hermes-data assets and restart Adelia
+      - name: Pull live hermes-data checkout and restart Adelia
         env:
           SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
           HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
@@ -18,45 +18,42 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
           ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=40 \
-              -o TCPKeepAlive=yes -o ConnectTimeout=30 \
+              -o TCPKeepAlive=yes -o ConnectTimeout=45 \
               -i ~/.ssh/id_ed25519 root@5.189.159.195 'bash -se' <<'REMOTE'
-          set -euo pipefail
-
-          SRC=/tmp/hermes-data-deploy
-          rm -rf "$SRC"
-          git clone --depth 1 --branch master https://github.com/adrozdenko/hermes-data.git "$SRC"
+          set -euxo pipefail
 
           patch_soul() {
             root="$1"
             soul="$root/profiles/adelia/SOUL.md"
             [ -f "$soul" ] || return 0
             python3 - "$soul" <<'PYEOF'
-          from pathlib import Path
-          import sys
-          path = Path(sys.argv[1])
-          text = path.read_text(encoding='utf-8')
-          marker = 'export_visual.py'
-          paragraph = ('\nЯкщо під час створення сторіс/поста системний Chromium або браузерний скріншот недоступний, '
-                       'це не фінальний результат і не причина віддавати лише HTML. Не кажи користувачу «Chromium немає» '
-                       'як завершення задачі. Створи фінальний SVG-макет у workspace і конвертуй його у PNG через '
-                       '`/opt/data/skills/smm/instagram-visual-workflow/scripts/export_visual.py`. Тільки якщо браузерний шлях '
-                       'і SVG->PNG fallback обидва провалилися, коротко назви точну технічну помилку.\n')
-          if marker not in text:
-              needle = 'Згенеровані зображення для постів мають бути brand-safe і copyright-safe.\n'
-              if needle in text:
-                  text = text.replace(needle, needle + paragraph, 1)
-              else:
-                  text = text.rstrip() + '\n' + paragraph
-              path.write_text(text, encoding='utf-8')
-          PYEOF
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+text = path.read_text(encoding='utf-8')
+marker = 'export_visual.py'
+paragraph = ('\nЯкщо під час створення сторіс/поста системний Chromium або браузерний скріншот недоступний, '
+             'це не фінальний результат і не причина віддавати лише HTML. Не кажи користувачу «Chromium немає» '
+             'як завершення задачі. Створи фінальний SVG-макет у workspace і конвертуй його у PNG через '
+             '`/opt/data/skills/smm/instagram-visual-workflow/scripts/export_visual.py`. Тільки якщо браузерний шлях '
+             'і SVG->PNG fallback обидва провалилися, коротко назви точну технічну помилку.\n')
+if marker not in text:
+    needle = 'Згенеровані зображення для постів мають бути brand-safe і copyright-safe.\n'
+    if needle in text:
+        text = text.replace(needle, needle + paragraph, 1)
+    else:
+        text = text.rstrip() + '\n' + paragraph
+    path.write_text(text, encoding='utf-8')
+PYEOF
           }
 
-          deploy_root() {
+          update_root() {
             root="$1"
-            [ -d "$root" ] || return 0
-            mkdir -p "$root/skills/smm"
-            rm -rf "$root/skills/smm/instagram-visual-workflow"
-            cp -a "$SRC/skills/smm/instagram-visual-workflow" "$root/skills/smm/instagram-visual-workflow"
+            [ -d "$root" ] || return 1
+            [ -d "$root/.git" ] || return 1
+            git config --global --add safe.directory "$root" || true
+            git -C "$root" fetch origin master
+            git -C "$root" checkout origin/master -- skills/smm/instagram-visual-workflow
             chmod +x "$root/skills/smm/instagram-visual-workflow/scripts/export_visual.py"
 
             if [ -d "$root/skills/instagram-visual-workflow" ]; then
@@ -68,9 +65,12 @@ jobs:
             patch_soul "$root"
           }
 
-          deploy_root /opt/hermes/clients/adelia
-          deploy_root /opt/data
+          UPDATED=0
+          update_root /opt/hermes/clients/adelia && UPDATED=1 || true
+          update_root /opt/data && UPDATED=1 || true
+          test "$UPDATED" = 1
 
+          docker ps -a --format '{{.Names}} {{.Status}}' | grep -E 'hermes|adelia' || true
           docker exec hermes-adelia sh -lc 'python3 -m py_compile /opt/data/skills/smm/instagram-visual-workflow/scripts/export_visual.py && test -x /opt/data/skills/smm/instagram-visual-workflow/scripts/export_visual.py && grep -q export_visual.py /opt/data/profiles/adelia/SOUL.md'
           docker exec hermes-adelia /command/s6-svc -t /run/service/gateway-default
           sleep 5
