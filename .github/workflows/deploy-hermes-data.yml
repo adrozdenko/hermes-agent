@@ -26,25 +26,9 @@ jobs:
             root="$1"
             soul="$root/profiles/adelia/SOUL.md"
             [ -f "$soul" ] || return 0
-            python3 - "$soul" <<'PYEOF'
-from pathlib import Path
-import sys
-path = Path(sys.argv[1])
-text = path.read_text(encoding='utf-8')
-marker = 'export_visual.py'
-paragraph = ('\nЯкщо під час створення сторіс/поста системний Chromium або браузерний скріншот недоступний, '
-             'це не фінальний результат і не причина віддавати лише HTML. Не кажи користувачу «Chromium немає» '
-             'як завершення задачі. Створи фінальний SVG-макет у workspace і конвертуй його у PNG через '
-             '`/opt/data/skills/smm/instagram-visual-workflow/scripts/export_visual.py`. Тільки якщо браузерний шлях '
-             'і SVG->PNG fallback обидва провалилися, коротко назви точну технічну помилку.\n')
-if marker not in text:
-    needle = 'Згенеровані зображення для постів мають бути brand-safe і copyright-safe.\n'
-    if needle in text:
-        text = text.replace(needle, needle + paragraph, 1)
-    else:
-        text = text.rstrip() + '\n' + paragraph
-    path.write_text(text, encoding='utf-8')
-PYEOF
+            if ! grep -q 'export_visual.py' "$soul"; then
+              printf '\n%s\n' 'Якщо під час створення сторіс/поста системний Chromium або браузерний скріншот недоступний, це не фінальний результат і не причина віддавати лише HTML. Не кажи користувачу «Chromium немає» як завершення задачі. Створи фінальний SVG-макет у workspace і конвертуй його у PNG через `/opt/data/skills/smm/instagram-visual-workflow/scripts/export_visual.py`. Тільки якщо браузерний шлях і SVG->PNG fallback обидва провалилися, коротко назви точну технічну помилку.' >> "$soul"
+            fi
           }
 
           update_root() {
