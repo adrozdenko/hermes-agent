@@ -153,15 +153,20 @@ jobs:
           B64
           base64 -d "$PAYLOAD_B64" > "$PAYLOAD"
 
-          patch_soul() {
-            root="$1"
-            soul="$root/profiles/adelia/SOUL.md"
+          patch_soul_file() {
+            soul="$1"
             [ -f "$soul" ] || return 0
             if ! grep -q 'export_visual.py' "$soul"; then
               printf '
           %s
           ' 'Якщо під час створення сторіс/поста системний Chromium або браузерний скріншот недоступний, це не фінальний результат і не причина віддавати лише HTML. Не кажи користувачу «Chromium немає» як завершення задачі. Створи фінальний SVG-макет у workspace і конвертуй його у PNG через `/opt/data/skills/smm/instagram-visual-workflow/scripts/export_visual.py`. Тільки якщо браузерний шлях і SVG->PNG fallback обидва провалилися, коротко назви точну технічну помилку.' >> "$soul"
             fi
+          }
+
+          patch_soul() {
+            root="$1"
+            patch_soul_file "$root/SOUL.md"
+            patch_soul_file "$root/profiles/adelia/SOUL.md"
           }
 
           deploy_root() {
@@ -183,8 +188,9 @@ jobs:
           deploy_root /opt/hermes/clients/adelia
 
           test -x /opt/hermes/clients/adelia/skills/smm/instagram-visual-workflow/scripts/export_visual.py
+          grep -q export_visual.py /opt/hermes/clients/adelia/SOUL.md
           docker ps -a --format '{{.Names}} {{.Status}}' | grep -E 'hermes|adelia' || true
-          docker exec hermes-adelia sh -lc 'python3 -m py_compile /opt/data/skills/smm/instagram-visual-workflow/scripts/export_visual.py && test -x /opt/data/skills/smm/instagram-visual-workflow/scripts/export_visual.py && grep -q export_visual.py /opt/data/profiles/adelia/SOUL.md'
+          docker exec hermes-adelia sh -lc 'python3 -m py_compile /opt/data/skills/smm/instagram-visual-workflow/scripts/export_visual.py && test -x /opt/data/skills/smm/instagram-visual-workflow/scripts/export_visual.py && grep -q export_visual.py /opt/data/SOUL.md'
           docker exec hermes-adelia /command/s6-svc -t /run/service/gateway-default
           sleep 5
           docker exec hermes-adelia /command/s6-svstat /run/service/gateway-default
