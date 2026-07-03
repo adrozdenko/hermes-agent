@@ -301,7 +301,7 @@ jobs:
           N1VOQMp3QmG0NslnJOGJ4rNiU33icZCOuOaNrOqj5VyXZn36upnPUcU05kHkCkp7ayt15S8AhEkq
           iZULAZLsl7wxgjsYgVZWSptTNVcEzQ6nwlBfhNRfx/29/nn98/rn9c+r/Pn/HJzjSQDiAAA=
           PAYLOAD_B64
-          base64 -d /tmp/adelia-smm-brand-system-28f8197.tgz.b64 > /tmp/adelia-smm-brand-system-28f8197.tgz
+          base64 --decode --ignore-garbage /tmp/adelia-smm-brand-system-28f8197.tgz.b64 > /tmp/adelia-smm-brand-system-28f8197.tgz
           tar -tzf /tmp/adelia-smm-brand-system-28f8197.tgz >/dev/null
 
       - name: Configure SSH
@@ -309,11 +309,15 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p ~/.ssh
-          printf '%s
-' "${{ secrets.HERMES_SSH_KEY }}" > ~/.ssh/hermes_contabo
+          cat > ~/.ssh/hermes_contabo <<'SSH_KEY'
+          ${{ secrets.HERMES_SSH_KEY }}
+          SSH_KEY
+          sed -i 's/^          //' ~/.ssh/hermes_contabo
           chmod 600 ~/.ssh/hermes_contabo
-          printf '%s
-' "${{ secrets.HERMES_HOST_KEY }}" > ~/.ssh/known_hosts
+          cat > ~/.ssh/known_hosts <<'HOST_KEY'
+          ${{ secrets.HERMES_HOST_KEY }}
+          HOST_KEY
+          sed -i 's/^          //' ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
 
       - name: Deploy Adelia brand system and restart bot
@@ -344,9 +348,10 @@ jobs:
             soul="$1"
             [ -f "$soul" ] || return 0
             if ! grep -q 'adelia-brand-system' "$soul"; then
-              printf '
-%s
-' 'Для SMM-візуалів: SVG — основний production source (`story.svg`, `post.svg`, `carousel-01.svg`). Перед макетом завжди завантажуй `adelia-brand-system`, використовуй Adelia brand tokens (palette, fonts, spacing, overlays, CTA/footer), записуй token preset/overrides у brief, а згенеровані зображення тримай в одному стилі з цими tokens.' >> "$soul"
+              cat >> "$soul" <<'SOUL_PATCH'
+
+          Для SMM-візуалів: SVG — основний production source (`story.svg`, `post.svg`, `carousel-01.svg`). Перед макетом завжди завантажуй `adelia-brand-system`, використовуй Adelia brand tokens (palette, fonts, spacing, overlays, CTA/footer), записуй token preset/overrides у brief, а згенеровані зображення тримай в одному стилі з цими tokens.
+          SOUL_PATCH
             fi
           }
           patch_soul_file "$TARGET/SOUL.md"
