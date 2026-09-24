@@ -1,0 +1,63 @@
+name: Probe Contabo Telegram auth
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe telegram auth paths
+        env:
+          SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
+          HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
+          ssh -o ServerAliveInterval=15 -o ConnectTimeout=20 \
+              -i ~/.ssh/id_ed25519 root@5.189.159.195 bash -s <<'REMOTE'
+          set -uo pipefail
+          echo "===== gateway status ====="
+          docker exec hermes sh -c '
+            PATH="/command:/package/admin/s6/command:$PATH"
+            s6-svstat /run/service/gateway-default
+            ps -eo pid,etime,args | grep "hermes gateway" | grep -v grep
+          '
+          echo "===== default config telegram block ====="
+          docker exec hermes python3 - <<'PY'
+          from pathlib import Path
+          try:
+            import yaml
+          except ImportError:
+            print("no yaml"); raise SystemExit
+          for p in [
+            Path("/opt/data/config.yaml"),
+            Path("/opt/data/profiles/alfred/config.yaml"),
+            Path("/opt/data/profiles/default/config.yaml"),
+          ]:
+            print(f"\n## {p} exists={p.exists()}")
+            if not p.exists():
+              continue
+            data = yaml.safe_load(p.read_text()) or {}
+            plats = data.get("platforms") or {}
+            tg = plats.get("telegram") if isinstance(plats, dict) else None
+            print("platforms.telegram=", tg)
+            # pairing / security
+            for k in ("security", "gateway", "pairing"):
+              if k in data:
+                print(f"{k}=", data.get(k))
+          PY
+          echo "===== pairing / allowlist files ====="
+          docker exec hermes sh -c '
+            ls -la /opt/data/pairing /opt/data/.pairing /opt/data/gateway 2>/dev/null | head -40
+            find /opt/data -maxdepth 3 \( -name "*pair*" -o -name "*allow*" -o -name "*auth*users*" \) 2>/dev/null | head -40
+          ' || true
+          echo "===== recent telegram lines (10m) ====="
+          docker logs --since 10m hermes 2>&1 | grep -iE 'Telegram|unauthorized|321340950|allow_from|paired|polling|Conflict|getUpdates|connected' | tail -50 || true
+          echo "===== proxy ====="
+          docker exec hermes sh -c 'curl -fsS -m 5 http://127.0.0.1:11435/health | head -c 200; echo'
+          echo "probe: done"
+          REMOTE
