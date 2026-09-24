@@ -1,11 +1,15 @@
 name: Recover Contabo (restart loop)
 
-# Emergency stabilize: inspect + stop dashboard + restart gateway + wait health.
-# Does NOT rebuild the image. Manual only. Run from any branch so main push
-# does not also fire Deploy to Contabo.
+# Emergency stabilize for Contabo hermes. Manual only. No image rebuild unless
+# you also push a code fix via Deploy.
 
 on:
   workflow_dispatch:
+    inputs:
+      quarantine_bad_profiles:
+        description: "Move invalid profile dirs (leading . or failing name regex) aside"
+        type: boolean
+        default: true
 
 jobs:
   recover:
@@ -15,6 +19,7 @@ jobs:
         env:
           SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
           HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
+          QUARANTINE: ${{ inputs.quarantine_bad_profiles }}
         run: |
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
@@ -23,28 +28,62 @@ jobs:
           printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
           ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=40 \
               -o TCPKeepAlive=yes -o ConnectTimeout=30 \
-              -i ~/.ssh/id_ed25519 root@5.189.159.195 'bash -s' <<'REMOTE'
+              -i ~/.ssh/id_ed25519 root@5.189.159.195 \
+              "export QUARANTINE=$(printf '%q' "$QUARANTINE"); bash -se" <<'REMOTE'
           set -uo pipefail
 
           echo "================ BEFORE ================"
           docker ps -a --filter name=hermes --format 'table {{.Names}}\t{{.Status}}\t{{.RunningFor}}'
           for c in hermes hermes-dashboard; do
-            echo "--- $c inspect ---"
-            docker inspect -f 'RestartCount={{.RestartCount}} OOM={{.State.OOMKilled}} Exit={{.State.ExitCode}} Err={{.State.Error}} Started={{.State.StartedAt}} Finished={{.State.FinishedAt}} Health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} RoleEnv={{range .Config.Env}}{{println .}}{{end}}' "$c" 2>&1 | head -40
+            echo "--- $c ---"
+            docker inspect -f 'RestartCount={{.RestartCount}} OOM={{.State.OOMKilled}} Exit={{.State.ExitCode}} Health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} Started={{.State.StartedAt}}' "$c" 2>&1 || true
           done
 
-          echo
-          echo "================ hermes logs (tail 120) ================"
-          docker logs --tail 120 hermes 2>&1 || true
+          VOL=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/opt/data"}}{{.Source}}{{end}}{{end}}' hermes 2>/dev/null || true)
+          [ -n "$VOL" ] || VOL=/root/.hermes
+          echo "volume=$VOL"
+          echo "profiles:"; ls -la "$VOL/profiles" 2>&1 | head -40 || true
 
-          echo
+          if [ "${QUARANTINE:-true}" = "true" ]; then
+            echo "================ QUARANTINE bad profiles ================"
+            mkdir -p "$VOL/profiles/_quarantine"
+            # Move leading-dot dirs and anything that is not [a-z0-9][a-z0-9_-]*
+            for d in "$VOL/profiles"/* "$VOL/profiles"/.[!.]* "$VOL/profiles"/..?*; do
+              [ -d "$d" ] || continue
+              base=$(basename "$d")
+              case "$base" in
+                _quarantine|_template|.*) ;;
+                *)
+                  if printf '%s' "$base" | grep -Eq '^[a-z0-9][a-z0-9_-]*$'; then
+                    continue
+                  fi
+                  ;;
+              esac
+              # Always quarantine leading-dot dirs; also non-regex names except _template kept as scaffold
+              if [ "$base" = "_template" ] || [ "$base" = "_quarantine" ]; then
+                continue
+              fi
+              if printf '%s' "$base" | grep -Eq '^[a-z0-9][a-z0-9_-]*$'; then
+                continue
+              fi
+              dest="$VOL/profiles/_quarantine/$base"
+              if [ -e "$dest" ]; then
+                dest="$VOL/profiles/_quarantine/${base}.$(date +%s)"
+              fi
+              echo "quarantine: $d -> $dest"
+              mv "$d" "$dest"
+            done
+            # Explicit known tombstone
+            if [ -d "$VOL/profiles/.jam-migrated-20260713" ]; then
+              mv "$VOL/profiles/.jam-migrated-20260713" \
+                 "$VOL/profiles/_quarantine/.jam-migrated-20260713.$(date +%s)"
+              echo "quarantined .jam-migrated-20260713"
+            fi
+            ls -la "$VOL/profiles" 2>&1 | head -40 || true
+          fi
+
           echo "================ STABILIZE ================"
-          # Dashboard shares /opt/data; if its role gate misses, it fights the
-          # gateway for the claude-proxy log lock and flaps both containers.
-          echo "stopping hermes-dashboard..."
           docker stop hermes-dashboard 2>&1 || true
-
-          echo "restarting hermes..."
           docker restart hermes 2>&1 || true
 
           probe() {
@@ -55,19 +94,20 @@ jobs:
           }
 
           ok=""
-          for i in $(seq 1 60); do  # up to 5 min
+          stable=0
+          for i in $(seq 1 72); do  # up to 6 min
             running=$(docker inspect -f '{{.State.Running}}' hermes 2>/dev/null || echo false)
             restarting=$(docker inspect -f '{{.State.Restarting}}' hermes 2>/dev/null || echo false)
             started=$(docker inspect -f '{{.State.StartedAt}}' hermes 2>/dev/null || true)
             if [ "$running" = "true" ] && [ "$restarting" = "false" ] && probe; then
-              # Require ~45s stable uptime so we don't declare victory mid-flap.
-              if docker exec hermes sh -c 'awk "{print int(\$1)}" /proc/uptime' 2>/dev/null | awk '{exit !($1>=40)}'; then
+              stable=$((stable + 1))
+              echo "recover: health OK streak=$stable/12 (attempt $i started=$started)"
+              if [ "$stable" -ge 12 ]; then  # 12 * 5s = 60s continuous
                 ok=1
-                echo "recover: hermes stable + :11435 OK (attempt $i, started=$started)"
                 break
               fi
-              echo "recover: health OK but uptime still short (attempt $i)"
             else
+              stable=0
               last=$(docker logs --tail 1 hermes 2>&1 | tr -d '\r' || true)
               echo "recover: waiting (attempt $i running=$running restarting=$restarting) [$last]"
             fi
@@ -75,21 +115,27 @@ jobs:
           done
 
           if [ -z "$ok" ]; then
-            echo "recover: FAILED to stabilize hermes"
+            echo "recover: FAILED"
             docker ps -a --filter name=hermes
-            docker logs --tail 80 hermes 2>&1 || true
+            docker logs --tail 120 hermes 2>&1 || true
+            docker logs hermes 2>&1 | grep -iE 'ValueError|reconcile|Resource busy|exitcode 111|FATAL' | tail -40 || true
             exit 1
           fi
 
-          echo "starting hermes-dashboard..."
           docker start hermes-dashboard 2>&1 || true
-          sleep 10
+          sleep 15
+          # Re-check gateway still healthy after dashboard is back
+          if ! probe; then
+            echo "recover: WARN gateway lost /health after dashboard start — stopping dashboard again"
+            docker stop hermes-dashboard 2>&1 || true
+          fi
 
-          echo
           echo "================ AFTER ================"
           docker ps -a --filter name=hermes --format 'table {{.Names}}\t{{.Status}}\t{{.RunningFor}}'
-          docker exec hermes sh -c 'curl -fsS -m 5 http://127.0.0.1:11435/health' 2>&1 | head -c 400
+          docker exec hermes sh -c 'curl -fsS -m 5 http://127.0.0.1:11435/health' 2>&1 | head -c 500
           echo
           echo "RestartCount hermes=$(docker inspect -f '{{.RestartCount}}' hermes)"
+          # Confirm reconcile no longer dies on the tombstone
+          docker logs hermes 2>&1 | grep -E 'ValueError|jam-migrated|reconcile-profiles exited' | tail -20 || echo "(no reconcile ValueError in recent logs)"
           echo "recover: done"
           REMOTE

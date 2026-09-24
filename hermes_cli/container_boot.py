@@ -75,17 +75,25 @@ def _named_profile_dirs(hermes_home: Path) -> list[tuple[str, Path]]:
     for entry in sorted(profiles_root.iterdir()):
         if not entry.is_dir() or not (entry / "SOUL.md").exists():
             continue
-        # Skip scaffold/template dirs (leading underscore, e.g. '_template').
-        # They carry a SOUL.md but are not runnable profiles, and their names
-        # fail validate_profile_name — which would otherwise raise inside
+        # Skip scaffold/template dirs (leading underscore, e.g. '_template')
+        # and migration tombstones (leading dot, e.g. '.jam-migrated-…').
+        # They may carry a SOUL.md but are not runnable profiles, and their
+        # names fail validate_profile_name — which would otherwise raise inside
         # _register_service and abort the ENTIRE reconcile, leaving every
-        # later profile's gateway slot unregistered. Genuinely invalid names
-        # (e.g. uppercase) are NOT caught here and still surface as a hard error.
-        if entry.name.startswith("_"):
+        # later profile's gateway slot unregistered.
+        if entry.name.startswith(("_", ".")):
             log.info(
-                "skipping scaffold dir profiles/%s (not a runnable profile)",
+                "skipping non-profile dir profiles/%s (scaffold/tombstone)",
                 entry.name,
             )
+            continue
+        # Soft-skip any other name that would fail the s6-safe regex so a
+        # stale on-disk folder cannot take the whole gateway down on boot.
+        from hermes_cli.service_manager import validate_profile_name
+        try:
+            validate_profile_name(entry.name)
+        except ValueError as exc:
+            log.warning("skipping invalid profile dir profiles/%s (%s)", entry.name, exc)
             continue
         # "default" is reserved for the root profile slot.
         if entry.name == "default":
