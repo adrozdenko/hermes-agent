@@ -75,20 +75,36 @@ jobs:
           # Ensure qrcode present in app venv (idempotent).
           "$APP/.venv/bin/pip" install -q 'qrcode[pil]>=7.4'
 
-          echo "starting bot-link (URI will not be printed)"
-          set +e
-          "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli \
-            bot-link --qr-out "$QR_OUT" --timeout 180
-          RC=$?
-          set -e
-          echo "bot-link exit=$RC"
-          if [ -f "$QR_OUT" ]; then
+          # Cancel any leftover link from a previous attempt.
+          "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli bot-link-cancel || true
+          rm -f "$QR_OUT"
+
+          echo "starting bot-link in background (URI will not be printed)"
+          # Critical: do NOT block SSH for the full 180s — PNG must ship while
+          # signal-cli is still waiting for the phone scan.
+          nohup "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli \
+            bot-link --qr-out "$QR_OUT" --timeout 180 \
+            >/tmp/sf-bot-link.log 2>&1 &
+          echo "bot-link pid=$!"
+
+          READY=0
+          for i in $(seq 1 90); do
+            if [ -f "$QR_OUT" ] && [ -s "$QR_OUT" ]; then
+              READY=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$READY" = 1 ]; then
             ls -la "$QR_OUT"
             echo "QR_PNG_READY=1"
           else
             echo "QR_PNG_READY=0"
+            echo "--- tail sf-bot-link.log (no URI expected) ---"
+            tail -n 40 /tmp/sf-bot-link.log 2>/dev/null || true
+            exit 1
           fi
-          # Status only — no secrets
+          # Status only — no secrets. Link process keeps waiting on host.
           "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli bot-link-status || true
           exit 0
           REMOTE
