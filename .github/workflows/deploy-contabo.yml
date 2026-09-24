@@ -22,6 +22,7 @@ on:
       - '.github/workflows/signal-flow-bot-link.yml'
       - '.github/workflows/signal-flow-bot-register.yml'
       - '.github/workflows/signal-flow-bot-verify.yml'
+      - '.github/workflows/signal-flow-captcha-novnc.yml'
   workflow_dispatch:
 
 jobs:

@@ -1,0 +1,330 @@
+name: Signal Flow captcha noVNC (Contabo)
+
+# Short-lived noVNC + Chromium on Contabo so an operator can solve
+# https://signalcaptchas.org/registration/generate.html from a phone,
+# using Contabo's public IP (same IP as signal-cli register).
+# Manual workflow_dispatch only. Never rebuilds Hermes. Does NOT click
+# Open Signal or solve the captcha. Session auto-tears down after ~20 min.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  captcha-novnc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Start short-lived noVNC captcha session on Contabo
+        env:
+          SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
+          HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SSH_KEY:-}" ] || [ -z "${HOST_KEY:-}" ]; then
+            echo "Missing HERMES_SSH_KEY or HERMES_HOST_KEY" >&2
+            exit 1
+          fi
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
+
+          LOG=/tmp/sf-captcha-novnc.log
+          : > "$LOG"
+
+          # Background SSH; heredoc closes BEFORE SSH_PID=$! (bash requirement).
+          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=60 \
+              -o TCPKeepAlive=yes -o ConnectTimeout=30 \
+              -i ~/.ssh/id_ed25519 root@5.189.159.195 'bash -s' \
+              > >(tee -a "$LOG") 2> >(tee -a "$LOG" >&2) <<'REMOTE' &
+          set -euo pipefail
+          SESSION_DIR=/opt/signal-flow/captcha-session
+          DISPLAY_NUM=99
+          VNC_PORT=$((5900 + DISPLAY_NUM))
+          NOVNC_PORT=6080
+          GEOMETRY=1280x800
+          HOLD_SECS=$((20 * 60))
+          CAPTCHA_URL='https://signalcaptchas.org/registration/generate.html'
+          UFW_OPENED=0
+          CF_PID=""
+          WS_PID=""
+          CHROME_PID=""
+
+          cleanup() {
+            set +e
+            echo "=== tearing down captcha noVNC session ==="
+            [ -n "${CHROME_PID:-}" ] && kill "$CHROME_PID" 2>/dev/null
+            pkill -f "chromium.*signalcaptchas" 2>/dev/null || true
+            pkill -f "chrome.*signalcaptchas" 2>/dev/null || true
+            [ -n "${WS_PID:-}" ] && kill "$WS_PID" 2>/dev/null
+            pkill -f "websockify.*${NOVNC_PORT}" 2>/dev/null || true
+            [ -n "${CF_PID:-}" ] && kill "$CF_PID" 2>/dev/null
+            pkill -f "cloudflared tunnel --url" 2>/dev/null || true
+            command -v tigervncserver >/dev/null 2>&1 && tigervncserver -kill ":${DISPLAY_NUM}" 2>/dev/null || true
+            command -v vncserver >/dev/null 2>&1 && vncserver -kill ":${DISPLAY_NUM}" 2>/dev/null || true
+            if [ "${UFW_OPENED:-0}" = 1 ] && command -v ufw >/dev/null 2>&1; then
+              ufw delete allow "${NOVNC_PORT}/tcp" 2>/dev/null || true
+              echo "ufw: closed ${NOVNC_PORT}/tcp"
+            fi
+            echo "TEARDOWN_DONE=1"
+          }
+          trap cleanup EXIT
+
+          mkdir -p "$SESSION_DIR"
+          chmod 700 "$SESSION_DIR"
+
+          export DEBIAN_FRONTEND=noninteractive
+          need_apt=0
+          if ! command -v tigervncserver >/dev/null 2>&1 && ! command -v vncserver >/dev/null 2>&1; then
+            need_apt=1
+          fi
+          command -v websockify >/dev/null 2>&1 || need_apt=1
+          [ -d /usr/share/novnc ] || need_apt=1
+          CHROME_BIN=""
+          for c in chromium-browser chromium google-chrome-stable google-chrome; do
+            if command -v "$c" >/dev/null 2>&1; then CHROME_BIN="$(command -v "$c")"; break; fi
+          done
+          [ -n "$CHROME_BIN" ] || need_apt=1
+
+          if [ "$need_apt" = 1 ]; then
+            apt-get update -qq
+            apt-get install -y -qq \
+              tigervnc-standalone-server tigervnc-common \
+              novnc websockify \
+              dbus-x11 x11-utils \
+              curl ca-certificates openssl || true
+            apt-get install -y -qq chromium-browser 2>/dev/null \
+              || apt-get install -y -qq chromium 2>/dev/null \
+              || apt-get install -y -qq google-chrome-stable 2>/dev/null \
+              || true
+          fi
+
+          CHROME_BIN=""
+          for c in chromium-browser chromium google-chrome-stable google-chrome; do
+            if command -v "$c" >/dev/null 2>&1; then CHROME_BIN="$(command -v "$c")"; break; fi
+          done
+          if [ -z "$CHROME_BIN" ]; then
+            echo "chromium missing — fetching google-chrome-stable .deb"
+            TMP=$(mktemp -d)
+            curl -fsSL -o "$TMP/chrome.deb" \
+              https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+            apt-get install -y -qq "$TMP/chrome.deb" || dpkg -i "$TMP/chrome.deb" || true
+            apt-get install -f -y -qq || true
+            rm -rf "$TMP"
+            for c in google-chrome-stable google-chrome chromium-browser chromium; do
+              if command -v "$c" >/dev/null 2>&1; then CHROME_BIN="$(command -v "$c")"; break; fi
+            done
+          fi
+          if [ -z "$CHROME_BIN" ]; then
+            echo "ERROR: no chromium/chrome binary" >&2
+            exit 1
+          fi
+          echo "CHROME_BIN=$CHROME_BIN"
+
+          NOVNC_WEB=""
+          for d in /usr/share/novnc /usr/share/novnc/app /usr/share/webapps/novnc; do
+            if [ -f "$d/vnc.html" ] || [ -f "$d/vnc_lite.html" ]; then NOVNC_WEB="$d"; break; fi
+          done
+          if [ -z "$NOVNC_WEB" ]; then
+            echo "ERROR: noVNC web root not found" >&2
+            exit 1
+          fi
+          echo "NOVNC_WEB=$NOVNC_WEB"
+
+          VNC_PASS="$(openssl rand -base64 18 | tr -dc 'A-Za-z0-9' | head -c 12)"
+          if [ "${#VNC_PASS}" -lt 8 ]; then
+            VNC_PASS="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 12)"
+          fi
+          PASS_FILE="$SESSION_DIR/vnc.pass"
+          if command -v vncpasswd >/dev/null 2>&1; then
+            printf '%s\n' "$VNC_PASS" | vncpasswd -f > "$PASS_FILE"
+          else
+            printf '%s' "$VNC_PASS" > "$PASS_FILE"
+          fi
+          chmod 600 "$PASS_FILE"
+          printf '%s\n' "$VNC_PASS" > "$SESSION_DIR/vnc.pass.txt"
+          chmod 600 "$SESSION_DIR/vnc.pass.txt"
+
+          command -v tigervncserver >/dev/null 2>&1 && tigervncserver -kill ":${DISPLAY_NUM}" 2>/dev/null || true
+          command -v vncserver >/dev/null 2>&1 && vncserver -kill ":${DISPLAY_NUM}" 2>/dev/null || true
+          fuser -k "${VNC_PORT}/tcp" 2>/dev/null || true
+          fuser -k "${NOVNC_PORT}/tcp" 2>/dev/null || true
+
+          export HOME="$SESSION_DIR"
+          mkdir -p "$HOME/.vnc"
+          cp -f "$PASS_FILE" "$HOME/.vnc/passwd"
+          chmod 600 "$HOME/.vnc/passwd"
+          cat > "$HOME/.vnc/xstartup" <<'XS'
+          #!/bin/sh
+          unset SESSION_MANAGER
+          unset DBUS_SESSION_BUS_ADDRESS
+          xsetroot -solid grey 2>/dev/null || true
+          exec /bin/sh -c 'while true; do sleep 3600; done'
+          XS
+          chmod +x "$HOME/.vnc/xstartup"
+
+          VNC_STARTED=0
+          if command -v tigervncserver >/dev/null 2>&1; then
+            if tigervncserver ":${DISPLAY_NUM}" -geometry "$GEOMETRY" -depth 24 \
+                -localhost yes -SecurityTypes VncAuth -PasswordFile "$HOME/.vnc/passwd" \
+                -xstartup "$HOME/.vnc/xstartup"; then
+              VNC_STARTED=1
+            fi
+          fi
+          if [ "$VNC_STARTED" != 1 ] && command -v vncserver >/dev/null 2>&1; then
+            if vncserver ":${DISPLAY_NUM}" -geometry "$GEOMETRY" -depth 24 -localhost yes; then
+              VNC_STARTED=1
+            fi
+          fi
+          if [ "$VNC_STARTED" != 1 ]; then
+            echo "ERROR: failed to start VNC on :${DISPLAY_NUM}" >&2
+            exit 1
+          fi
+          echo "VNC_STARTED=1 display=:${DISPLAY_NUM} port=${VNC_PORT}"
+          sleep 2
+
+          if command -v dbus-launch >/dev/null 2>&1; then
+            eval "$(dbus-launch --sh-syntax)" || true
+          fi
+          export DISPLAY=":${DISPLAY_NUM}"
+
+          PROFILE="$SESSION_DIR/chrome-profile"
+          mkdir -p "$PROFILE"
+          "$CHROME_BIN" \
+            --no-sandbox \
+            --disable-dev-shm-usage \
+            --disable-gpu \
+            --disable-software-rasterizer \
+            --no-first-run \
+            --no-default-browser-check \
+            --disable-translate \
+            --window-size=1280,800 \
+            --user-data-dir="$PROFILE" \
+            "$CAPTCHA_URL" \
+            >"$SESSION_DIR/chromium.log" 2>&1 &
+          CHROME_PID=$!
+          echo "CHROME_PID=$CHROME_PID"
+          sleep 3
+
+          websockify --web="$NOVNC_WEB" "127.0.0.1:${NOVNC_PORT}" "127.0.0.1:${VNC_PORT}" \
+            >"$SESSION_DIR/websockify.log" 2>&1 &
+          WS_PID=$!
+          echo "WS_PID=$WS_PID"
+          sleep 2
+          if ! kill -0 "$WS_PID" 2>/dev/null; then
+            echo "ERROR: websockify failed" >&2
+            tail -n 40 "$SESSION_DIR/websockify.log" || true
+            exit 1
+          fi
+
+          NOVNC_URL=""
+          ensure_cloudflared() {
+            if command -v cloudflared >/dev/null 2>&1; then return 0; fi
+            echo "installing cloudflared"
+            curl -fsSL -o /usr/local/bin/cloudflared \
+              "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" \
+              && chmod +x /usr/local/bin/cloudflared
+            command -v cloudflared >/dev/null 2>&1
+          }
+
+          if ensure_cloudflared; then
+            CF_LOG="$SESSION_DIR/cloudflared.log"
+            : > "$CF_LOG"
+            cloudflared tunnel --url "http://127.0.0.1:${NOVNC_PORT}" \
+              >"$CF_LOG" 2>&1 &
+            CF_PID=$!
+            echo "CF_PID=$CF_PID"
+            for i in $(seq 1 45); do
+              NOVNC_URL="$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' "$CF_LOG" | head -n1 || true)"
+              [ -n "$NOVNC_URL" ] && break
+              kill -0 "$CF_PID" 2>/dev/null || { echo "cloudflared exited early"; tail -n 30 "$CF_LOG" || true; break; }
+              sleep 1
+            done
+            if [ -n "$NOVNC_URL" ] && [ -f "$NOVNC_WEB/vnc.html" ]; then
+              NOVNC_URL="${NOVNC_URL}/vnc.html"
+            fi
+          fi
+
+          if [ -z "$NOVNC_URL" ]; then
+            echo "cloudflared unavailable — fallback ufw :${NOVNC_PORT}"
+            if command -v ufw >/dev/null 2>&1; then
+              ufw allow "${NOVNC_PORT}/tcp" || true
+              UFW_OPENED=1
+            fi
+            kill "$WS_PID" 2>/dev/null || true
+            pkill -f "websockify.*${NOVNC_PORT}" 2>/dev/null || true
+            sleep 1
+            websockify --web="$NOVNC_WEB" "0.0.0.0:${NOVNC_PORT}" "127.0.0.1:${VNC_PORT}" \
+              >"$SESSION_DIR/websockify.log" 2>&1 &
+            WS_PID=$!
+            NOVNC_URL="http://5.189.159.195:${NOVNC_PORT}/vnc.html"
+          fi
+
+          echo "NOVNC_URL=${NOVNC_URL}"
+          echo "NOVNC_PASS=${VNC_PASS}"
+          echo "SESSION_HOLD_SECS=${HOLD_SECS}"
+          echo "holding session for ${HOLD_SECS}s"
+
+          end=$((SECONDS + HOLD_SECS))
+          while [ "$SECONDS" -lt "$end" ]; do
+            left=$((end - SECONDS))
+            echo "heartbeat left=${left}s chrome=$(kill -0 $CHROME_PID 2>/dev/null && echo ok || echo dead) ws=$(kill -0 $WS_PID 2>/dev/null && echo ok || echo dead)"
+            sleep 60
+          done
+          echo "hold complete — cleanup via trap"
+          REMOTE
+          SSH_PID=$!
+
+          # Wait for NOVNC_URL / NOVNC_PASS markers (setup usually < 3 min)
+          URL=""
+          PASS=""
+          for i in $(seq 1 180); do
+            if ! kill -0 "$SSH_PID" 2>/dev/null; then
+              echo "SSH exited before session markers" >&2
+              tail -n 80 "$LOG" || true
+              shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519
+              exit 1
+            fi
+            if grep -q '^NOVNC_URL=' "$LOG" 2>/dev/null && grep -q '^NOVNC_PASS=' "$LOG" 2>/dev/null; then
+              URL="$(grep '^NOVNC_URL=' "$LOG" | tail -n1 | sed 's/^NOVNC_URL=//')"
+              PASS="$(grep '^NOVNC_PASS=' "$LOG" | tail -n1 | sed 's/^NOVNC_PASS=//')"
+              break
+            fi
+            sleep 2
+          done
+
+          if [ -z "$URL" ] || [ -z "$PASS" ]; then
+            echo "Timed out waiting for NOVNC_URL/NOVNC_PASS" >&2
+            tail -n 100 "$LOG" || true
+            kill "$SSH_PID" 2>/dev/null || true
+            shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519
+            exit 1
+          fi
+
+          {
+            echo "## Signal Flow captcha noVNC"
+            echo ""
+            echo "- **URL:** \`$URL\`"
+            echo "- **VNC password (one-time):** \`$PASS\`"
+            echo "- **Hold:** ~20 minutes then auto-teardown"
+            echo "- Open URL on phone → enter password → solve captcha page"
+            echo "- Do **not** need to click Open Signal in the browser"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "::notice::NOVNC_URL=${URL}"
+          echo "::notice::NOVNC_PASS=${PASS} (one-time VNC password; session ~20 min)"
+          echo "NOVNC_URL=${URL}"
+          echo "NOVNC_PASS=${PASS}"
+          echo "Session live — waiting for remote hold+teardown (SSH pid=$SSH_PID)"
+
+          set +e
+          wait "$SSH_PID"
+          RC=$?
+          set -e
+          echo "remote_exit=$RC"
+          shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519
+          if grep -q 'TEARDOWN_DONE=1' "$LOG" 2>/dev/null; then
+            exit 0
+          fi
+          exit "$RC"
