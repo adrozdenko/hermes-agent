@@ -50,6 +50,11 @@ jobs:
           unset LD_PRELOAD
 
           grab_token() {
+            # 0) Handler / previous capture file
+            if [ -f /opt/signal-flow/config/last-captcha.token ]; then
+              tok="$(tr -d '\r\n' < /opt/signal-flow/config/last-captcha.token)"
+              case "$tok" in signalcaptcha://*) printf '%s' "$tok"; return 0 ;; esac
+            fi
             # 1) Chromium log (Open Signal → failed handler often logs full URI)
             for f in "$SESSION_DIR/chromium.log" /tmp/chromium*.log; do
               [ -f "$f" ] || continue

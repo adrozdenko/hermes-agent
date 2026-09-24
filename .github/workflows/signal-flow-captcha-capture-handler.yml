@@ -1,0 +1,163 @@
+name: Signal Flow captcha capture-handler
+
+# Install signalcaptcha:// handler on Contabo + extend noVNC hold.
+# Operator clicks Open Signal once; token lands in
+# /opt/signal-flow/config/last-captcha.token (never printed).
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'install handler + extend; or scan for token'
+        required: true
+        type: choice
+        options:
+          - install-extend
+          - scan
+        default: install-extend
+
+jobs:
+  captcha-handler:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Contabo captcha handler (${{ inputs.action }})
+        env:
+          SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
+          HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
+          ACTION: ${{ inputs.action }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
+          ssh -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 root@5.189.159.195 \
+            ACTION="$ACTION" bash -s <<'REMOTE'
+          set -euo pipefail
+          SESSION_DIR=/opt/signal-flow/captcha-session
+          TOKEN_FILE=/opt/signal-flow/config/last-captcha.token
+          mkdir -p /opt/signal-flow/config /usr/local/bin /usr/share/applications
+
+          if [ "${ACTION}" = "install-extend" ]; then
+            cat > /usr/local/bin/signalcaptcha-handler <<'H'
+          #!/bin/bash
+          umask 077
+          TOK="${1:-}"
+          [ -n "$TOK" ] || exit 0
+          printf '%s\n' "$TOK" > /opt/signal-flow/config/last-captcha.token
+          chmod 600 /opt/signal-flow/config/last-captcha.token
+          date -u +"captured_at=%Y-%m-%dT%H:%M:%SZ len=${#TOK}" >> /opt/signal-flow/config/last-captcha.meta
+          H
+            # strip accidental leading spaces from embedded heredoc lines
+            sed -i 's/^          //' /usr/local/bin/signalcaptcha-handler
+            chmod 755 /usr/local/bin/signalcaptcha-handler
+            # verify shebang
+            if ! head -1 /usr/local/bin/signalcaptcha-handler | grep -q '^#!/bin/bash'; then
+              printf '%s\n' \
+                '#!/bin/bash' \
+                'umask 077' \
+                'TOK="${1:-}"' \
+                '[ -n "$TOK" ] || exit 0' \
+                'printf "%s\n" "$TOK" > /opt/signal-flow/config/last-captcha.token' \
+                'chmod 600 /opt/signal-flow/config/last-captcha.token' \
+                'date -u +"captured_at=%Y-%m-%dT%H:%M:%SZ len=${#TOK}" >> /opt/signal-flow/config/last-captcha.meta' \
+                > /usr/local/bin/signalcaptcha-handler
+              chmod 755 /usr/local/bin/signalcaptcha-handler
+            fi
+
+            printf '%s\n' \
+              '[Desktop Entry]' \
+              'Name=Signal Captcha Capture' \
+              'Exec=/usr/local/bin/signalcaptcha-handler %u' \
+              'Type=Application' \
+              'Terminal=false' \
+              'NoDisplay=true' \
+              'MimeType=x-scheme-handler/signalcaptcha;' \
+              > /usr/share/applications/signalcaptcha.desktop
+            update-desktop-database /usr/share/applications 2>/dev/null || true
+            xdg-mime default signalcaptcha.desktop x-scheme-handler/signalcaptcha 2>/dev/null || true
+            mkdir -p /root/.config
+            printf '%s\n' '[Default Applications]' 'x-scheme-handler/signalcaptcha=signalcaptcha.desktop' \
+              > /root/.config/mimeapps.list
+            if [ -d "$SESSION_DIR" ]; then
+              mkdir -p "$SESSION_DIR/.config"
+              printf '%s\n' '[Default Applications]' 'x-scheme-handler/signalcaptcha=signalcaptcha.desktop' \
+                > "$SESSION_DIR/.config/mimeapps.list"
+            fi
+            # BROWSER fallback: wrap xdg-open
+            if [ ! -e /usr/local/bin/xdg-open.real ] && command -v xdg-open >/dev/null 2>&1; then
+              XDG=$(command -v xdg-open)
+              cp -f "$XDG" /usr/local/bin/xdg-open.real 2>/dev/null || true
+            fi
+            cat > /usr/local/bin/xdg-open-signalcaptcha-wrap <<'W'
+          #!/bin/bash
+          case "${1:-}" in
+            signalcaptcha://*) exec /usr/local/bin/signalcaptcha-handler "$1" ;;
+          esac
+          if [ -x /usr/local/bin/xdg-open.real ]; then
+            exec /usr/local/bin/xdg-open.real "$@"
+          fi
+          exec /usr/bin/xdg-open "$@"
+          W
+            sed -i 's/^          //' /usr/local/bin/xdg-open-signalcaptcha-wrap
+            chmod 755 /usr/local/bin/xdg-open-signalcaptcha-wrap
+            echo "HANDLER_INSTALLED=1 handler=$(head -1 /usr/local/bin/signalcaptcha-handler)"
+
+            systemctl stop sf-captcha-teardown.service 2>/dev/null || true
+            systemctl reset-failed sf-captcha-teardown.service 2>/dev/null || true
+            pkill -f 'sleep 1800.*tigervnc|captcha-session/teardown' 2>/dev/null || true
+            TEARDOWN_AT=$(date -u -d '+30 minutes' +%Y-%m-%dT%H:%M:%SZ)
+            if systemd-run --unit=sf-captcha-teardown --on-active=30min \
+              /bin/bash -c 'pkill -f "chromium.*signalcaptchas" 2>/dev/null; pkill -f "chrome.*signalcaptchas" 2>/dev/null; tigervncserver -kill :99 2>/dev/null; vncserver -kill :99 2>/dev/null; pkill -f "websockify.*6080" 2>/dev/null; pkill -f "cloudflared tunnel" 2>/dev/null; date -u +"torn_down=%FT%TZ" >> /opt/signal-flow/captcha-session/teardown.log'; then
+              echo "TEARDOWN_SCHED=systemd-run-30min"
+            else
+              nohup bash -c 'sleep 1800; pkill -f "chromium.*signalcaptchas" 2>/dev/null; tigervncserver -kill :99 2>/dev/null; pkill -f "websockify.*6080" 2>/dev/null' \
+                </dev/null >>/opt/signal-flow/captcha-session/teardown-fallback.log 2>&1 &
+              echo "TEARDOWN_SCHED=nohup-30min pid=$!"
+            fi
+            echo "TEARDOWN_EXTENDED_TO=${TEARDOWN_AT}"
+            pgrep -af 'Xvnc|websockify|chromium|openbox' | head -n 12 || echo "WARN: no VNC procs"
+            # Same password as before if info.env exists
+            if [ -f "$SESSION_DIR/info.env" ]; then
+              grep '^NOVNC_DIRECT_URL=' "$SESSION_DIR/info.env" || true
+              grep '^NOVNC_PASS=' "$SESSION_DIR/info.env" | sed 's/=.*/=[set]/' || true
+            fi
+            echo "INSTALL_DONE=1"
+            exit 0
+          fi
+
+          echo "scanning for captcha token"
+          FOUND=0
+          if [ -f "$TOKEN_FILE" ] && [ -s "$TOKEN_FILE" ]; then
+            echo "TOKEN_FILE_PRESENT=1 len=$(wc -c < "$TOKEN_FILE")"
+            FOUND=1
+          else
+            echo "TOKEN_FILE_PRESENT=0"
+          fi
+          for root in "$SESSION_DIR" /root/snap/chromium/common/chromium; do
+            [ -d "$root" ] || continue
+            n=$(grep -rhoE 'signalcaptcha://[^[:space:]\"<>]+' "$root" 2>/dev/null | wc -l || echo 0)
+            echo "scan_${root}=${n}"
+            if [ "${n:-0}" -gt 0 ]; then
+              tok=$(grep -rhoE 'signalcaptcha://[^[:space:]\"<>]+' "$root" 2>/dev/null | tail -n1)
+              printf '%s\n' "$tok" > "$TOKEN_FILE"
+              chmod 600 "$TOKEN_FILE"
+              echo "TOKEN_CAPTURED_FROM_SCAN=1 len=${#tok}"
+              FOUND=1
+            fi
+          done
+          export DISPLAY=:99
+          [ -f "$SESSION_DIR/.Xauthority" ] && export XAUTHORITY="$SESSION_DIR/.Xauthority"
+          if command -v xclip >/dev/null 2>&1; then
+            clip=$(xclip -selection clipboard -o 2>/dev/null || true)
+            case "$clip" in
+              signalcaptcha://*)
+                printf '%s\n' "$clip" > "$TOKEN_FILE"; chmod 600 "$TOKEN_FILE"
+                echo "TOKEN_FROM_CLIPBOARD=1 len=${#clip}"; FOUND=1 ;;
+            esac
+          fi
+          echo "FOUND=$FOUND"
+          [ "$FOUND" = 1 ]
+          REMOTE
+          shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519
