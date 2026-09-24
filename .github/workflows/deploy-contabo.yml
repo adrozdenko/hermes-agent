@@ -19,6 +19,7 @@ on:
       # Signal Flow Contabo helpers — never rebuild Hermes
       - '.github/workflows/install-signal-flow-layout.yml'
       - '.github/workflows/install-signal-flow-app.yml'
+      - '.github/workflows/signal-flow-bot-link.yml'
   workflow_dispatch:
 
 jobs:
