@@ -247,7 +247,19 @@ jobs:
           echo "CHROME_PID=$CHROME_PID"
           sleep 2
 
-          nohup websockify --web="$NOVNC_WEB" "127.0.0.1:${NOVNC_PORT}" "127.0.0.1:${VNC_PORT}" \
+          # Bind on all interfaces so phone can use Contabo IP if trycloudflare is blocked.
+          if command -v ufw >/dev/null 2>&1; then
+            ufw allow "${NOVNC_PORT}/tcp" || true
+            UFW_OPENED=1
+            echo 1 > "$SESSION_DIR/ufw.opened"
+          else
+            UFW_OPENED=0
+          fi
+          # Contabo often uses iptables directly; open 6080 defensively.
+          iptables -C INPUT -p tcp --dport "${NOVNC_PORT}" -j ACCEPT 2>/dev/null \
+            || iptables -I INPUT -p tcp --dport "${NOVNC_PORT}" -j ACCEPT || true
+
+          nohup websockify --web="$NOVNC_WEB" "0.0.0.0:${NOVNC_PORT}" "127.0.0.1:${VNC_PORT}" \
             </dev/null >"$SESSION_DIR/websockify.log" 2>&1 &
           WS_PID=$!
           disown "$WS_PID" 2>/dev/null || true
@@ -259,9 +271,9 @@ jobs:
             exit 1
           fi
 
+          DIRECT_URL="http://5.189.159.195:${NOVNC_PORT}/vnc.html"
           NOVNC_URL=""
           CF_PID=""
-          UFW_OPENED=0
           ensure_cloudflared() {
             if command -v cloudflared >/dev/null 2>&1; then return 0; fi
             echo "installing cloudflared"
@@ -290,21 +302,11 @@ jobs:
             fi
           fi
 
+          # Prefer direct Contabo IP for UA networks that block trycloudflare DNS.
           if [ -z "$NOVNC_URL" ]; then
-            echo "cloudflared unavailable — fallback ufw :${NOVNC_PORT}"
-            if command -v ufw >/dev/null 2>&1; then
-              ufw allow "${NOVNC_PORT}/tcp" || true
-              UFW_OPENED=1
-            fi
-            kill "$WS_PID" 2>/dev/null || true
-            pkill -f "websockify.*${NOVNC_PORT}" 2>/dev/null || true
-            sleep 1
-            nohup websockify --web="$NOVNC_WEB" "0.0.0.0:${NOVNC_PORT}" "127.0.0.1:${VNC_PORT}" \
-              </dev/null >"$SESSION_DIR/websockify.log" 2>&1 &
-            WS_PID=$!
-            disown "$WS_PID" 2>/dev/null || true
-            NOVNC_URL="http://5.189.159.195:${NOVNC_PORT}/vnc.html"
+            NOVNC_URL="$DIRECT_URL"
           fi
+          echo "NOVNC_DIRECT_URL=${DIRECT_URL}"
 
           STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           TEARDOWN_AT="$(date -u -d "+${HOLD_SECS} seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
@@ -383,6 +385,7 @@ jobs:
           # Markers — must be last meaningful stdout before exit
           echo "NOVNC_URL=${NOVNC_URL}"
           echo "NOVNC_PASS=${VNC_PASS}"
+          echo "NOVNC_DIRECT_URL=${DIRECT_URL}"
           echo "TEARDOWN_AT=${TEARDOWN_AT}"
           echo "SETUP_DONE=1"
           # Explicitly close leftover FDs / ignore children
@@ -393,6 +396,7 @@ jobs:
 
           URL="$(grep '^NOVNC_URL=' "$LOG" | tail -n1 | sed 's/^NOVNC_URL=//' || true)"
           PASS="$(grep '^NOVNC_PASS=' "$LOG" | tail -n1 | sed 's/^NOVNC_PASS=//' || true)"
+          DIRECT="$(grep '^NOVNC_DIRECT_URL=' "$LOG" | tail -n1 | sed 's/^NOVNC_DIRECT_URL=//' || true)"
           TEARDOWN="$(grep '^TEARDOWN_AT=' "$LOG" | tail -n1 | sed 's/^TEARDOWN_AT=//' || true)"
           LIVE="$(grep '^SESSION_LIVE=' "$LOG" | tail -n1 | sed 's/^SESSION_LIVE=//' || true)"
 
@@ -436,8 +440,10 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
           echo "::notice::NOVNC_URL=${URL}"
+          echo "::notice::NOVNC_DIRECT_URL=${DIRECT}"
           echo "::notice::NOVNC_PASS=${PASS} (one-time VNC password; session ~20 min on Contabo)"
           echo "NOVNC_URL=${URL}"
+          echo "NOVNC_DIRECT_URL=${DIRECT}"
           echo "NOVNC_PASS=${PASS}"
           [ -n "$TEARDOWN" ] && echo "TEARDOWN_AT=${TEARDOWN}"
           shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519
