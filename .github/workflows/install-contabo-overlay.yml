@@ -1,0 +1,31 @@
+name: Install Contabo compose overlay
+
+on:
+  workflow_dispatch:
+
+jobs:
+  install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Copy overlay to Contabo
+        env:
+          SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
+          HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
+          scp -i ~/.ssh/id_ed25519 docker-compose.contabo-cmd.yml \
+            root@5.189.159.195:/opt/hermes/docker-compose.contabo-cmd.yml
+          # Also keep a copy next to app tree for deploy layering
+          ssh -i ~/.ssh/id_ed25519 root@5.189.159.195 bash -s <<'REMOTE'
+          set -e
+          mkdir -p /opt/hermes/app
+          cp -f /opt/hermes/docker-compose.contabo-cmd.yml /opt/hermes/app/docker-compose.contabo-cmd.yml
+          # Ensure host base compose does not fight — leave as-is; overlay wins when layered.
+          ls -la /opt/hermes/docker-compose.contabo-cmd.yml /opt/hermes/app/docker-compose.contabo-cmd.yml
+          # Confirm live hermes still healthy
+          docker inspect -f 'Cmd={{json .Config.Cmd}} Status={{.State.Status}} Health={{if .State.Health}}{{.State.Health.Status}}{{end}} UptimeStarted={{.State.StartedAt}}' hermes
+          docker exec hermes sh -c 'curl -fsS -m 5 -o /dev/null http://127.0.0.1:11435/health && echo PROXY_OK'
+          REMOTE
