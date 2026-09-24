@@ -173,6 +173,36 @@ jobs:
           fi
           command -v openbox >/dev/null 2>&1 || { echo "ERROR: openbox missing" >&2; exit 1; }
 
+          # signalcaptcha:// capture handler (Open Signal writes token to disk)
+          mkdir -p /opt/signal-flow/config /usr/local/bin /usr/share/applications
+          printf '%s\n' \
+            '#!/bin/bash' \
+            'umask 077' \
+            'TOK="${1:-}"' \
+            '[ -n "$TOK" ] || exit 0' \
+            'printf "%s\n" "$TOK" > /opt/signal-flow/config/last-captcha.token' \
+            'chmod 600 /opt/signal-flow/config/last-captcha.token' \
+            'date -u +"captured_at=%Y-%m-%dT%H:%M:%SZ len=${#TOK}" >> /opt/signal-flow/config/last-captcha.meta' \
+            > /usr/local/bin/signalcaptcha-handler
+          chmod 755 /usr/local/bin/signalcaptcha-handler
+          printf '%s\n' \
+            '[Desktop Entry]' \
+            'Name=Signal Captcha Capture' \
+            'Exec=/usr/local/bin/signalcaptcha-handler %u' \
+            'Type=Application' \
+            'Terminal=false' \
+            'NoDisplay=true' \
+            'MimeType=x-scheme-handler/signalcaptcha;' \
+            > /usr/share/applications/signalcaptcha.desktop
+          update-desktop-database /usr/share/applications 2>/dev/null || true
+          xdg-mime default signalcaptcha.desktop x-scheme-handler/signalcaptcha 2>/dev/null || true
+          mkdir -p "$SESSION_DIR/.config" /root/.config
+          printf '%s\n' '[Default Applications]' 'x-scheme-handler/signalcaptcha=signalcaptcha.desktop' \
+            | tee /root/.config/mimeapps.list > "$SESSION_DIR/.config/mimeapps.list"
+          # xclip for clipboard fallback
+          command -v xclip >/dev/null 2>&1 || apt-get install -y -qq xclip sqlite3 || true
+          echo "CAPTCHA_HANDLER=1"
+
           NOVNC_WEB=""
           for d in /usr/share/novnc /usr/share/novnc/app /usr/share/webapps/novnc; do
             if [ -f "$d/vnc.html" ] || [ -f "$d/vnc_lite.html" ]; then NOVNC_WEB="$d"; break; fi
@@ -201,14 +231,32 @@ jobs:
           chmod 600 "$HOME/.vnc/passwd"
           PROFILE="$SESSION_DIR/chrome-profile"
           mkdir -p "$PROFILE"
-          # Prefer real chromium binary over chromium-browser wrapper/snap.
-          if [ -x /usr/lib/chromium-browser/chromium-browser ]; then
+          # Prefer Google Chrome or deb chromium; avoid snap (profile/XDG broken).
+          if [ -x /usr/bin/google-chrome-stable ]; then
+            CHROME_BIN=/usr/bin/google-chrome-stable
+          elif [ -x /usr/bin/google-chrome ]; then
+            CHROME_BIN=/usr/bin/google-chrome
+          elif [ -x /usr/lib/chromium-browser/chromium-browser ]; then
             CHROME_BIN=/usr/lib/chromium-browser/chromium-browser
           elif [ -x /usr/lib/chromium/chromium ]; then
             CHROME_BIN=/usr/lib/chromium/chromium
-          elif command -v chromium >/dev/null 2>&1; then
+          elif command -v chromium >/dev/null 2>&1 && ! command -v chromium | grep -q snap; then
             CHROME_BIN="$(command -v chromium)"
           fi
+          # If only snap chromium exists, try installing google-chrome quickly
+          case "$CHROME_BIN" in
+            *snap*|"")
+              if [ ! -x /usr/bin/google-chrome-stable ]; then
+                echo "installing google-chrome-stable (snap chromium is unreliable here)"
+                curl -fsSL https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -o /tmp/chrome.deb \
+                  && apt-get install -y -qq /tmp/chrome.deb \
+                  && rm -f /tmp/chrome.deb || true
+              fi
+              if [ -x /usr/bin/google-chrome-stable ]; then
+                CHROME_BIN=/usr/bin/google-chrome-stable
+              fi
+              ;;
+          esac
           echo "CHROME_BIN=$CHROME_BIN"
 
           # xstartup: window manager only. Chrome starts AFTER VNC with DISPLAY set.
@@ -269,6 +317,8 @@ jobs:
             --disable-gpu \
             --disable-software-rasterizer \
             --ozone-platform=x11 \
+            --remote-debugging-port=9222 \
+            --remote-allow-origins=* \
             --no-first-run \
             --no-default-browser-check \
             --disable-translate \
@@ -387,7 +437,7 @@ jobs:
           # Schedule auto-teardown on host (prefer systemd-run, else at, else nohup sleep)
           TEARDOWN_SCHED=""
           if command -v systemd-run >/dev/null 2>&1; then
-            if systemd-run --on-active=20min --timer-property=AccuracySec=1s \
+            if systemd-run --on-active=35min --timer-property=AccuracySec=1s \
                 /bin/bash "$SESSION_DIR/teardown.sh" 2>"$SESSION_DIR/teardown-sched.err"; then
               TEARDOWN_SCHED="systemd-run-20min"
             fi
