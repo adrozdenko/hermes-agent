@@ -4,7 +4,8 @@ name: Signal Flow captcha noVNC (Contabo)
 # https://signalcaptchas.org/registration/generate.html from a phone,
 # using Contabo's public IP (same IP as signal-cli register).
 # Manual workflow_dispatch only. Never rebuilds Hermes. Does NOT click
-# Open Signal or solve the captcha. Session auto-tears down after ~20 min.
+# Open Signal or solve the captcha. Session auto-tears down after ~20 min
+# on the host (Actions SSH exits as soon as URL/pass are printed).
 
 on:
   workflow_dispatch:
@@ -12,7 +13,7 @@ on:
 jobs:
   captcha-novnc:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
     steps:
       - name: Start short-lived noVNC captcha session on Contabo
         env:
@@ -31,14 +32,17 @@ jobs:
           printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
 
           LOG=/tmp/sf-captcha-novnc.log
-          : > "$LOG"
-
-          # Background SSH; heredoc closes BEFORE SSH_PID=$! (bash requirement).
-          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=60 \
+          # Foreground SSH: remote daemonizes the 20-min hold, prints markers, exits.
+          # stdbuf -oL keeps markers line-buffered through the SSH pipe.
+          stdbuf -oL -eL ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=40 \
               -o TCPKeepAlive=yes -o ConnectTimeout=30 \
-              -i ~/.ssh/id_ed25519 root@5.189.159.195 'bash -s' \
-              > >(tee -a "$LOG") 2> >(tee -a "$LOG" >&2) <<'REMOTE' &
+              -i ~/.ssh/id_ed25519 root@5.189.159.195 \
+              'stdbuf -oL -eL bash -s' <<'REMOTE' | stdbuf -oL -eL tee "$LOG"
           set -euo pipefail
+          # Force line-buffered stdout/stderr even if stdbuf missing on host
+          if command -v stdbuf >/dev/null 2>&1; then
+            :
+          fi
           SESSION_DIR=/opt/signal-flow/captcha-session
           DISPLAY_NUM=99
           VNC_PORT=$((5900 + DISPLAY_NUM))
@@ -46,33 +50,22 @@ jobs:
           GEOMETRY=1280x800
           HOLD_SECS=$((20 * 60))
           CAPTCHA_URL='https://signalcaptchas.org/registration/generate.html'
-          UFW_OPENED=0
-          CF_PID=""
-          WS_PID=""
-          CHROME_PID=""
-
-          cleanup() {
-            set +e
-            echo "=== tearing down captcha noVNC session ==="
-            [ -n "${CHROME_PID:-}" ] && kill "$CHROME_PID" 2>/dev/null
-            pkill -f "chromium.*signalcaptchas" 2>/dev/null || true
-            pkill -f "chrome.*signalcaptchas" 2>/dev/null || true
-            [ -n "${WS_PID:-}" ] && kill "$WS_PID" 2>/dev/null
-            pkill -f "websockify.*${NOVNC_PORT}" 2>/dev/null || true
-            [ -n "${CF_PID:-}" ] && kill "$CF_PID" 2>/dev/null
-            pkill -f "cloudflared tunnel --url" 2>/dev/null || true
-            command -v tigervncserver >/dev/null 2>&1 && tigervncserver -kill ":${DISPLAY_NUM}" 2>/dev/null || true
-            command -v vncserver >/dev/null 2>&1 && vncserver -kill ":${DISPLAY_NUM}" 2>/dev/null || true
-            if [ "${UFW_OPENED:-0}" = 1 ] && command -v ufw >/dev/null 2>&1; then
-              ufw delete allow "${NOVNC_PORT}/tcp" 2>/dev/null || true
-              echo "ufw: closed ${NOVNC_PORT}/tcp"
-            fi
-            echo "TEARDOWN_DONE=1"
-          }
-          trap cleanup EXIT
 
           mkdir -p "$SESSION_DIR"
           chmod 700 "$SESSION_DIR"
+
+          # Kill any prior captcha session leftovers
+          if [ -f "$SESSION_DIR/teardown.sh" ]; then
+            bash "$SESSION_DIR/teardown.sh" 2>/dev/null || true
+          fi
+          pkill -f "cloudflared tunnel --url" 2>/dev/null || true
+          pkill -f "websockify.*${NOVNC_PORT}" 2>/dev/null || true
+          pkill -f "chromium.*signalcaptchas" 2>/dev/null || true
+          pkill -f "chrome.*signalcaptchas" 2>/dev/null || true
+          command -v tigervncserver >/dev/null 2>&1 && tigervncserver -kill ":${DISPLAY_NUM}" 2>/dev/null || true
+          command -v vncserver >/dev/null 2>&1 && vncserver -kill ":${DISPLAY_NUM}" 2>/dev/null || true
+          fuser -k "${VNC_PORT}/tcp" 2>/dev/null || true
+          fuser -k "${NOVNC_PORT}/tcp" 2>/dev/null || true
 
           export DEBIAN_FRONTEND=noninteractive
           need_apt=0
@@ -88,12 +81,13 @@ jobs:
           [ -n "$CHROME_BIN" ] || need_apt=1
 
           if [ "$need_apt" = 1 ]; then
+            echo "apt: installing vnc/novnc/chromium deps"
             apt-get update -qq
             apt-get install -y -qq \
               tigervnc-standalone-server tigervnc-common \
               novnc websockify \
               dbus-x11 x11-utils \
-              curl ca-certificates openssl || true
+              curl ca-certificates openssl coreutils || true
             apt-get install -y -qq chromium-browser 2>/dev/null \
               || apt-get install -y -qq chromium 2>/dev/null \
               || apt-get install -y -qq google-chrome-stable 2>/dev/null \
@@ -145,11 +139,6 @@ jobs:
           chmod 600 "$PASS_FILE"
           printf '%s\n' "$VNC_PASS" > "$SESSION_DIR/vnc.pass.txt"
           chmod 600 "$SESSION_DIR/vnc.pass.txt"
-
-          command -v tigervncserver >/dev/null 2>&1 && tigervncserver -kill ":${DISPLAY_NUM}" 2>/dev/null || true
-          command -v vncserver >/dev/null 2>&1 && vncserver -kill ":${DISPLAY_NUM}" 2>/dev/null || true
-          fuser -k "${VNC_PORT}/tcp" 2>/dev/null || true
-          fuser -k "${NOVNC_PORT}/tcp" 2>/dev/null || true
 
           export HOME="$SESSION_DIR"
           mkdir -p "$HOME/.vnc"
@@ -219,6 +208,8 @@ jobs:
           fi
 
           NOVNC_URL=""
+          CF_PID=""
+          UFW_OPENED=0
           ensure_cloudflared() {
             if command -v cloudflared >/dev/null 2>&1; then return 0; fi
             echo "installing cloudflared"
@@ -261,43 +252,56 @@ jobs:
             NOVNC_URL="http://5.189.159.195:${NOVNC_PORT}/vnc.html"
           fi
 
+          # Persist markers for later grab/ops
+          printf '%s\n' "$NOVNC_URL" > "$SESSION_DIR/novnc.url"
+          printf '%s\n' "$VNC_PASS" > "$SESSION_DIR/vnc.pass.txt"
+          chmod 600 "$SESSION_DIR/novnc.url" "$SESSION_DIR/vnc.pass.txt"
+          date -u +%Y-%m-%dT%H:%M:%SZ > "$SESSION_DIR/started_at.utc"
+          echo "$HOLD_SECS" > "$SESSION_DIR/hold_secs"
+
+          # Teardown script + nohup hold (survives SSH exit)
+          cat > "$SESSION_DIR/teardown.sh" <<'TD'
+          #!/bin/bash
+          set +e
+          SESSION_DIR=/opt/signal-flow/captcha-session
+          DISPLAY_NUM=99
+          NOVNC_PORT=6080
+          VNC_PORT=$((5900 + DISPLAY_NUM))
+          echo "=== tearing down captcha noVNC session ==="
+          pkill -f "chromium.*signalcaptchas" 2>/dev/null
+          pkill -f "chrome.*signalcaptchas" 2>/dev/null
+          pkill -f "websockify.*${NOVNC_PORT}" 2>/dev/null
+          pkill -f "cloudflared tunnel --url" 2>/dev/null
+          command -v tigervncserver >/dev/null 2>&1 && tigervncserver -kill ":${DISPLAY_NUM}" 2>/dev/null
+          command -v vncserver >/dev/null 2>&1 && vncserver -kill ":${DISPLAY_NUM}" 2>/dev/null
+          if [ -f "$SESSION_DIR/ufw.opened" ]; then
+            ufw delete allow "${NOVNC_PORT}/tcp" 2>/dev/null
+            rm -f "$SESSION_DIR/ufw.opened"
+          fi
+          echo "TEARDOWN_DONE=1" | tee "$SESSION_DIR/teardown.done"
+          TD
+          chmod 700 "$SESSION_DIR/teardown.sh"
+          if [ "$UFW_OPENED" = 1 ]; then
+            echo 1 > "$SESSION_DIR/ufw.opened"
+          fi
+
+          nohup bash -c "sleep ${HOLD_SECS}; bash '$SESSION_DIR/teardown.sh'" \
+            >"$SESSION_DIR/hold.log" 2>&1 &
+          echo "HOLD_PID=$!"
+          echo "SESSION_HOLD_SECS=${HOLD_SECS}"
+
+          # Markers — must be last meaningful stdout before exit
           echo "NOVNC_URL=${NOVNC_URL}"
           echo "NOVNC_PASS=${VNC_PASS}"
-          echo "SESSION_HOLD_SECS=${HOLD_SECS}"
-          echo "holding session for ${HOLD_SECS}s"
-
-          end=$((SECONDS + HOLD_SECS))
-          while [ "$SECONDS" -lt "$end" ]; do
-            left=$((end - SECONDS))
-            echo "heartbeat left=${left}s chrome=$(kill -0 $CHROME_PID 2>/dev/null && echo ok || echo dead) ws=$(kill -0 $WS_PID 2>/dev/null && echo ok || echo dead)"
-            sleep 60
-          done
-          echo "hold complete — cleanup via trap"
+          echo "SETUP_DONE=1"
+          exit 0
           REMOTE
-          SSH_PID=$!
 
-          # Wait for NOVNC_URL / NOVNC_PASS markers (setup usually < 3 min)
-          URL=""
-          PASS=""
-          for i in $(seq 1 180); do
-            if ! kill -0 "$SSH_PID" 2>/dev/null; then
-              echo "SSH exited before session markers" >&2
-              tail -n 80 "$LOG" || true
-              shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519
-              exit 1
-            fi
-            if grep -q '^NOVNC_URL=' "$LOG" 2>/dev/null && grep -q '^NOVNC_PASS=' "$LOG" 2>/dev/null; then
-              URL="$(grep '^NOVNC_URL=' "$LOG" | tail -n1 | sed 's/^NOVNC_URL=//')"
-              PASS="$(grep '^NOVNC_PASS=' "$LOG" | tail -n1 | sed 's/^NOVNC_PASS=//')"
-              break
-            fi
-            sleep 2
-          done
-
+          URL="$(grep '^NOVNC_URL=' "$LOG" | tail -n1 | sed 's/^NOVNC_URL=//' || true)"
+          PASS="$(grep '^NOVNC_PASS=' "$LOG" | tail -n1 | sed 's/^NOVNC_PASS=//' || true)"
           if [ -z "$URL" ] || [ -z "$PASS" ]; then
-            echo "Timed out waiting for NOVNC_URL/NOVNC_PASS" >&2
-            tail -n 100 "$LOG" || true
-            kill "$SSH_PID" 2>/dev/null || true
+            echo "Failed to capture NOVNC_URL/NOVNC_PASS from remote" >&2
+            tail -n 120 "$LOG" || true
             shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519
             exit 1
           fi
@@ -307,24 +311,13 @@ jobs:
             echo ""
             echo "- **URL:** \`$URL\`"
             echo "- **VNC password (one-time):** \`$PASS\`"
-            echo "- **Hold:** ~20 minutes then auto-teardown"
+            echo "- **Hold:** ~20 minutes then auto-teardown on Contabo"
             echo "- Open URL on phone → enter password → solve captcha page"
             echo "- Do **not** need to click Open Signal in the browser"
           } >> "$GITHUB_STEP_SUMMARY"
 
           echo "::notice::NOVNC_URL=${URL}"
-          echo "::notice::NOVNC_PASS=${PASS} (one-time VNC password; session ~20 min)"
+          echo "::notice::NOVNC_PASS=${PASS} (one-time VNC password; session ~20 min on Contabo)"
           echo "NOVNC_URL=${URL}"
           echo "NOVNC_PASS=${PASS}"
-          echo "Session live — waiting for remote hold+teardown (SSH pid=$SSH_PID)"
-
-          set +e
-          wait "$SSH_PID"
-          RC=$?
-          set -e
-          echo "remote_exit=$RC"
           shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519
-          if grep -q 'TEARDOWN_DONE=1' "$LOG" 2>/dev/null; then
-            exit 0
-          fi
-          exit "$RC"
