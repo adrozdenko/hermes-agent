@@ -1,0 +1,64 @@
+name: Install Signal Flow app (Contabo)
+
+# Clone private adrozdenko/signal-flow onto Contabo and pip-install sf-admin.
+# Manual only. Does not rebuild Hermes. Does not print secrets or admin id.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  install-app:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone signal-flow with deploy key
+        env:
+          DEPLOY_KEY: ${{ secrets.SIGNAL_FLOW_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/sf_deploy
+          chmod 600 ~/.ssh/sf_deploy
+          printf 'Host github.com\n  IdentityFile ~/.ssh/sf_deploy\n  StrictHostKeyChecking accept-new\n' > ~/.ssh/config
+          git clone --depth 1 git@github.com:adrozdenko/signal-flow.git "$RUNNER_TEMP/signal-flow"
+          rm -rf "$RUNNER_TEMP/signal-flow/.git"
+          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/signal-flow.tgz" signal-flow
+
+      - name: Install on Contabo under /opt/signal-flow/app
+        env:
+          SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
+          HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
+          scp -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 \
+            "$RUNNER_TEMP/signal-flow.tgz" root@5.189.159.195:/tmp/signal-flow.tgz
+          ssh -o ServerAliveInterval=30 -o ConnectTimeout=30 \
+              -i ~/.ssh/id_ed25519 root@5.189.159.195 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          DATA_ROOT=/opt/signal-flow
+          APP="$DATA_ROOT/app"
+          test -d "$DATA_ROOT/config" || { echo "layout missing; run install-signal-flow-layout first" >&2; exit 1; }
+          tar -C "$DATA_ROOT" -xzf /tmp/signal-flow.tgz
+          rm -rf "$APP"
+          mv "$DATA_ROOT/signal-flow" "$APP"
+          rm -f /tmp/signal-flow.tgz
+          command -v python3 >/dev/null || { echo "python3 missing on host" >&2; exit 1; }
+          python3 -m venv "$APP/.venv"
+          "$APP/.venv/bin/pip" install -U pip
+          "$APP/.venv/bin/pip" install -e "$APP"
+          "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli list-users
+          cat > /usr/local/bin/sf-admin <<'WRAP'
+          #!/usr/bin/env bash
+          exec /opt/signal-flow/app/.venv/bin/sf-admin --data-root /opt/signal-flow "$@"
+          WRAP
+          chmod 755 /usr/local/bin/sf-admin
+          echo "install-signal-flow-app: done"
+          ls -la "$DATA_ROOT" "$APP" | head -40
+          REMOTE
+          shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519
+          shred -u ~/.ssh/sf_deploy 2>/dev/null || rm -f ~/.ssh/sf_deploy
