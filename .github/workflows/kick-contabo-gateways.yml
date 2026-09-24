@@ -1,0 +1,85 @@
+name: Kick Contabo Telegram gateways
+
+# Restart s6 gateway pollers + stop flapping dashboard. No image rebuild.
+on:
+  workflow_dispatch:
+
+jobs:
+  kick:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Kick gateways on Contabo
+        env:
+          SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
+          HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
+          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=60 \
+              -o TCPKeepAlive=yes -o ConnectTimeout=30 \
+              -i ~/.ssh/id_ed25519 root@5.189.159.195 bash -s <<'REMOTE'
+          set -uo pipefail
+
+          echo "================ BEFORE ================"
+          docker ps -a --filter name=hermes --format 'table {{.Names}}\t{{.Status}}\t{{.RunningFor}}'
+          docker inspect -f 'Cmd={{json .Config.Cmd}} RestartCount={{.RestartCount}} Health={{if .State.Health}}{{.State.Health.Status}}{{end}} Started={{.State.StartedAt}}' hermes || true
+
+          echo "================ STOP flapping dashboard ================"
+          docker stop hermes-dashboard 2>/dev/null || true
+          docker update --restart=no hermes-dashboard 2>/dev/null || true
+          echo "dashboard stopped; restart policy no"
+
+          echo "================ gateway s6 before ================"
+          docker exec hermes sh -c '
+            PATH="/command:/package/admin/s6/command:$PATH"
+            for s in gateway-default gateway-alfred; do
+              echo "-- $s --"
+              s6-svstat /run/service/$s 2>&1 || echo "(missing)"
+            done
+            ps -eo pid,args 2>/dev/null | grep -E "hermes.*gateway|claude_proxy" | grep -v grep || true
+          ' 2>&1 || true
+
+          echo "================ RESTART gateways ================"
+          docker exec hermes sh -c '
+            PATH="/command:/package/admin/s6/command:$PATH"
+            for s in gateway-default gateway-alfred; do
+              if [ -d /run/service/$s ]; then
+                echo "s6-svc -r $s"
+                s6-svc -r /run/service/$s || s6-svc -u /run/service/$s || true
+              fi
+            done
+          ' 2>&1 || true
+
+          sleep 8
+
+          echo "================ gateway s6 after ================"
+          docker exec hermes sh -c '
+            PATH="/command:/package/admin/s6/command:$PATH"
+            for s in gateway-default gateway-alfred; do
+              echo "-- $s --"
+              s6-svstat /run/service/$s 2>&1 || echo "(missing)"
+            done
+            ps -eo pid,args 2>/dev/null | grep -E "hermes.*gateway|claude_proxy" | grep -v grep || true
+          ' 2>&1 || true
+
+          echo "================ proxy health ================"
+          docker exec hermes sh -c 'curl -fsS -m 5 http://127.0.0.1:11435/health' && echo && echo PROXY_OK
+
+          echo "================ recent gateway logs ================"
+          for g in default alfred; do
+            echo "---- gateways/$g (last 40) ----"
+            docker exec hermes sh -c "ls -la /opt/data/logs/gateways/$g 2>/dev/null | tail -5"
+            docker exec hermes sh -c "tail -n 40 /opt/data/logs/gateways/$g/current 2>/dev/null || tail -n 40 /opt/data/logs/gateways/$g/*.log 2>/dev/null || true"
+          done
+
+          echo "================ docker logs hermes (tail 60) ================"
+          docker logs --tail 60 hermes 2>&1 || true
+
+          echo "================ AFTER ================"
+          docker ps -a --filter name=hermes --format 'table {{.Names}}\t{{.Status}}\t{{.RunningFor}}'
+          echo "kick: done"
+          REMOTE
