@@ -31,45 +31,37 @@ jobs:
           cat > /tmp/sf-cdp-scrape.py <<'PY'
           #!/usr/bin/env python3
           import json, sys, urllib.request
-          try:
-              import websocket
-          except ImportError:
-              import subprocess
-              subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "websocket-client"])
-              import websocket
 
           def tabs():
               with urllib.request.urlopen("http://127.0.0.1:9222/json/list", timeout=5) as r:
                   return json.load(r)
 
           def eval_expr(ws_url, expr):
-              ws = websocket.create_connection(ws_url, timeout=10)
+              try:
+                  import websocket
+              except ImportError:
+                  print("NO_WEBSOCKET_MODULE", file=sys.stderr)
+                  sys.exit(6)
+              ws = websocket.create_connection(ws_url, timeout=15)
               msg_id = 1
               ws.send(json.dumps({"id": msg_id, "method": "Runtime.evaluate", "params": {
                   "expression": expr, "returnByValue": True, "awaitPromise": True
               }}))
               while True:
-                  raw = ws.recv()
-                  data = json.loads(raw)
+                  data = json.loads(ws.recv())
                   if data.get("id") == msg_id:
                       ws.close()
                       return data
-              return None
 
           exprs = [
-              """(() => {
-                const as = Array.from(document.querySelectorAll('a[href]'));
-                const hit = as.find(a => (a.href||'').startsWith('signalcaptcha://'));
-                if (hit) return hit.href;
-                const any = as.map(a => a.href).filter(Boolean);
-                return any.join('\\n');
-              })()""",
-              """(() => {
-                const html = document.documentElement.innerHTML;
-                const m = html.match(/signalcaptcha:\\/\\/[^\\s\"'<>]+/);
-                return m ? m[0] : '';
-              })()""",
-              """(() => location.href)()""",
+              # Direct href
+              "(() => { const as=[...document.querySelectorAll('a[href]')]; const h=as.find(a=>(a.getAttribute('href')||'').startsWith('signalcaptcha://')||(a.href||'').startsWith('signalcaptcha://')); return h ? (h.getAttribute('href')||h.href) : ''; })()",
+              # Any signalcaptcha in DOM
+              "(() => { const html=document.documentElement.outerHTML; const m=html.match(/signalcaptcha:\\/\\/[^\\s\"'<>]+/); return m?m[0]:''; })()",
+              # All hrefs for debug (first 2k)
+              "(() => [...document.querySelectorAll('a[href]')].map(a=>a.getAttribute('href')||a.href).join('\\n'))()",
+              # Buttons / roles
+              "(() => [...document.querySelectorAll('a,button,[role=link]')].map(e=>({t:(e.innerText||'').slice(0,40), h:e.getAttribute('href')||'', o:e.getAttribute('onclick')||''})).map(x=>JSON.stringify(x)).join('\\n'))()",
           ]
 
           try:
@@ -81,10 +73,9 @@ jobs:
           print(f"CDP_TABS={len(tlist)}")
           for t in tlist:
               url = t.get("url") or ""
-              title = t.get("title") or ""
-              print(f"TAB url_host={url.split('/')[2] if url.startswith('http') else url[:40]} title={title[:40]}")
+              print(f"TAB type={t.get('type')} url={url[:100]}")
 
-          targets = [t for t in tlist if "signalcaptcha" in (t.get("url") or "") or "signalcaptchas" in (t.get("url") or "")]
+          targets = [t for t in tlist if "signalcaptchas.org" in (t.get("url") or "")]
           if not targets:
               targets = [t for t in tlist if t.get("type") == "page" and t.get("webSocketDebuggerUrl")]
           if not targets:
@@ -92,27 +83,40 @@ jobs:
               sys.exit(4)
 
           token = ""
+          debug_bits = []
           for t in targets:
               ws_url = t.get("webSocketDebuggerUrl")
               if not ws_url:
                   continue
-              for expr in exprs:
+              for i, expr in enumerate(exprs):
                   try:
                       data = eval_expr(ws_url, expr)
-                      val = (((data or {}).get("result") or {}).get("result") or {}).get("value") or ""
-                      if isinstance(val, str) and "signalcaptcha://" in val:
-                          # take first matching line
-                          for line in val.splitlines():
-                              line = line.strip()
-                              if line.startswith("signalcaptcha://"):
-                                  token = line
+                      val = (((data or {}).get("result") or {}).get("result") or {}).get("value")
+                      if val is None:
+                          err = ((data or {}).get("result") or {}).get("exceptionDetails")
+                          print(f"EVAL_{i}_EXC={str(err)[:120]}")
+                          continue
+                      sval = str(val)
+                      if "signalcaptcha://" in sval:
+                          for line in sval.replace("'", "\n").splitlines():
+                              line = line.strip().strip('"')
+                              if "signalcaptcha://" in line:
+                                  # extract URI
+                                  idx = line.find("signalcaptcha://")
+                                  tok = line[idx:].split()[0].strip("\"',;")
+                                  token = tok
                                   break
-                          if token:
-                              break
+                      else:
+                          debug_bits.append(f"EVAL_{i}_LEN={len(sval)} HEAD={sval[:180]!r}")
+                      if token:
+                          break
                   except Exception as e:
-                      print(f"EVAL_ERR={type(e).__name__}", file=sys.stderr)
+                      print(f"EVAL_ERR_{i}={type(e).__name__}:{e}", file=sys.stderr)
               if token:
                   break
+
+          for b in debug_bits[:8]:
+              print(b)
 
           if not token:
               print("CDP_NO_TOKEN", file=sys.stderr)
@@ -122,10 +126,9 @@ jobs:
           open(out, "w").write(token + "\n")
           import os
           os.chmod(out, 0o600)
-          open("/opt/signal-flow/config/last-captcha.meta", "a").write(
-              f"captured_via=cdp len={len(token)}\n"
-          )
+          open("/opt/signal-flow/config/last-captcha.meta", "a").write(f"captured_via=cdp len={len(token)}\n")
           print(f"CDP_TOKEN_CAPTURED=1 len={len(token)}")
+          PY
           PY
           scp -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 \
             /tmp/sf-cdp-scrape.py root@5.189.159.195:/tmp/sf-cdp-scrape.py
@@ -142,10 +145,18 @@ jobs:
           curl -sS -m 3 http://127.0.0.1:9222/json/version | head -c 200 || echo "CDP_VERSION_FAIL"
           echo
 
-          # Ensure websocket-client available
-          python3 -m pip install -q websocket-client 2>/dev/null || pip3 install -q websocket-client 2>/dev/null || true
+          # websocket-client via venv (PEP 668 blocks system pip)
+          apt-get install -y -qq python3-venv python3-websocket 2>/dev/null || true
+          VENV=/tmp/sf-cdp-venv
+          python3 -m venv "$VENV" 2>/dev/null || true
+          if [ -x "$VENV/bin/pip" ]; then
+            "$VENV/bin/pip" install -q websocket-client || true
+            PYBIN="$VENV/bin/python"
+          else
+            PYBIN=python3
+          fi
           set +e
-          python3 /tmp/sf-cdp-scrape.py
+          "$PYBIN" /tmp/sf-cdp-scrape.py
           CDP_RC=$?
           set -e
           echo "cdp_scrape_exit=$CDP_RC"
