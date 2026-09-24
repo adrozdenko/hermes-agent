@@ -125,6 +125,7 @@ jobs:
           fi
           command -v websockify >/dev/null 2>&1 || need_apt=1
           [ -d /usr/share/novnc ] || need_apt=1
+          command -v openbox >/dev/null 2>&1 || need_apt=1
           CHROME_BIN=""
           for c in chromium-browser chromium google-chrome-stable google-chrome; do
             if command -v "$c" >/dev/null 2>&1; then CHROME_BIN="$(command -v "$c")"; break; fi
@@ -136,7 +137,7 @@ jobs:
             apt-get update -qq
             apt-get install -y -qq \
               tigervnc-standalone-server tigervnc-common \
-              novnc websockify \
+              novnc websockify openbox \
               dbus-x11 x11-utils \
               curl ca-certificates openssl coreutils || true
             apt-get install -y -qq chromium-browser 2>/dev/null \
@@ -166,6 +167,11 @@ jobs:
             exit 1
           fi
           echo "CHROME_BIN=$CHROME_BIN"
+          if ! command -v openbox >/dev/null 2>&1; then
+            apt-get update -qq
+            apt-get install -y -qq openbox dbus-x11 x11-utils || true
+          fi
+          command -v openbox >/dev/null 2>&1 || { echo "ERROR: openbox missing" >&2; exit 1; }
 
           NOVNC_WEB=""
           for d in /usr/share/novnc /usr/share/novnc/app /usr/share/webapps/novnc; do
@@ -193,13 +199,37 @@ jobs:
           mkdir -p "$HOME/.vnc"
           cp -f "$PASS_FILE" "$HOME/.vnc/passwd"
           chmod 600 "$HOME/.vnc/passwd"
-          cat > "$HOME/.vnc/xstartup" <<'XS'
+          PROFILE="$SESSION_DIR/chrome-profile"
+          mkdir -p "$PROFILE"
+          # Expand CHROME_BIN / CAPTCHA_URL / PROFILE into xstartup so the
+          # desktop session owns Chromium (needs a WM — bare grey root was blank).
+          cat > "$HOME/.vnc/xstartup" <<XS
           #!/bin/sh
           unset SESSION_MANAGER
           unset DBUS_SESSION_BUS_ADDRESS
           xsetroot -solid grey 2>/dev/null || true
-          exec /bin/sh -c 'while true; do sleep 3600; done'
+          if command -v dbus-launch >/dev/null 2>&1; then
+            eval "\$(dbus-launch --sh-syntax)" || true
+          fi
+          openbox &
+          sleep 2
+          "$CHROME_BIN" \
+            --no-sandbox \
+            --disable-dev-shm-usage \
+            --disable-gpu \
+            --disable-software-rasterizer \
+            --no-first-run \
+            --no-default-browser-check \
+            --disable-translate \
+            --start-maximized \
+            --window-size=1280,800 \
+            --user-data-dir="$PROFILE" \
+            "$CAPTCHA_URL" \
+            >"$SESSION_DIR/chromium.log" 2>&1 &
+          wait
           XS
+          # Dedent xstartup body (YAML indent leaked into heredoc lines)
+          sed -i 's/^          //' "$HOME/.vnc/xstartup"
           chmod +x "$HOME/.vnc/xstartup"
 
           VNC_STARTED=0
@@ -220,32 +250,15 @@ jobs:
             exit 1
           fi
           echo "VNC_STARTED=1 display=:${DISPLAY_NUM} port=${VNC_PORT}"
-          sleep 2
-
-          if command -v dbus-launch >/dev/null 2>&1; then
-            eval "$(dbus-launch --sh-syntax)" || true
+          sleep 5
+          # Best-effort chrome pid for status
+          CHROME_PID="$(pgrep -f "signalcaptchas.org" | head -n1 || true)"
+          echo "CHROME_PID=${CHROME_PID:-unknown}"
+          if [ ! -s "$SESSION_DIR/chromium.log" ]; then
+            echo "WARN: chromium.log empty so far" >&2
+          else
+            tail -n 15 "$SESSION_DIR/chromium.log" || true
           fi
-          export DISPLAY=":${DISPLAY_NUM}"
-
-          PROFILE="$SESSION_DIR/chrome-profile"
-          mkdir -p "$PROFILE"
-          # Fully detach: nohup + redirect + disown so SSH pipe can close
-          nohup "$CHROME_BIN" \
-            --no-sandbox \
-            --disable-dev-shm-usage \
-            --disable-gpu \
-            --disable-software-rasterizer \
-            --no-first-run \
-            --no-default-browser-check \
-            --disable-translate \
-            --window-size=1280,800 \
-            --user-data-dir="$PROFILE" \
-            "$CAPTCHA_URL" \
-            </dev/null >"$SESSION_DIR/chromium.log" 2>&1 &
-          CHROME_PID=$!
-          disown "$CHROME_PID" 2>/dev/null || true
-          echo "CHROME_PID=$CHROME_PID"
-          sleep 2
 
           # Bind on all interfaces so phone can use Contabo IP if trycloudflare is blocked.
           if command -v ufw >/dev/null 2>&1; then
