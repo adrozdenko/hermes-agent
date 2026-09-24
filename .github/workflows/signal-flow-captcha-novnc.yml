@@ -98,7 +98,7 @@ jobs:
           VNC_PORT=$((5900 + DISPLAY_NUM))
           NOVNC_PORT=6080
           GEOMETRY=1280x800
-          HOLD_SECS=$((20 * 60))
+          HOLD_SECS=$((35 * 60))
           CAPTCHA_URL='https://signalcaptchas.org/registration/generate.html'
 
           mkdir -p "$SESSION_DIR"
@@ -439,12 +439,12 @@ jobs:
           if command -v systemd-run >/dev/null 2>&1; then
             if systemd-run --on-active=35min --timer-property=AccuracySec=1s \
                 /bin/bash "$SESSION_DIR/teardown.sh" 2>"$SESSION_DIR/teardown-sched.err"; then
-              TEARDOWN_SCHED="systemd-run-20min"
+              TEARDOWN_SCHED="systemd-run-35min"
             fi
           fi
           if [ -z "$TEARDOWN_SCHED" ] && command -v at >/dev/null 2>&1; then
             if echo "bash $SESSION_DIR/teardown.sh" | at now + 20 minutes 2>"$SESSION_DIR/teardown-sched.err"; then
-              TEARDOWN_SCHED="at-20min"
+              TEARDOWN_SCHED="at-35min"
             fi
           fi
           if [ -z "$TEARDOWN_SCHED" ]; then
