@@ -1,0 +1,7 @@
+# Contabo production: keep container CMD as sleep infinity.
+# The real gateway runs under s6 (gateway-default). A second `hermes gateway run`
+# as Docker CMD races the supervised slot, exits, and docker restarts the
+# container every ~20s (observed 2026-09-24 after upstream sync).
+services:
+  gateway:
+    command: ["sleep", "infinity"]

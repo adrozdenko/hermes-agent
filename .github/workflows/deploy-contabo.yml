@@ -247,6 +247,11 @@ jobs:
             echo "proxy-lock: WARN wiring not verified -- deploying with anon-on (bots unaffected)."
             echo "proxy-lock: WARN fix the cause above; the lock will engage on the next deploy."
           fi
+          # Contabo: never run a second gateway as Docker CMD (s6 owns it).
+          if [ -f /opt/hermes/app/docker-compose.contabo-cmd.yml ]; then
+            COMPOSE_FILES="$COMPOSE_FILES -f /opt/hermes/app/docker-compose.contabo-cmd.yml"
+            echo "compose: layered contabo-cmd (CMD=sleep infinity)"
+          fi
           docker compose $COMPOSE_FILES up -d
 
           # ---- Post-deploy health gate ---------------------------------
