@@ -1,0 +1,223 @@
+name: Signal Flow bot CDP-scrape + register
+
+# While Contabo noVNC Chromium is on signalcaptchas.org after solve,
+# scrape signalcaptcha:// via CDP :9222 and SMS-register. Never echo token.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  cdp-register:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: CDP scrape captcha + SMS register on Contabo
+        env:
+          SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
+          HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
+          PHONE: ${{ secrets.SIGNAL_FLOW_BOT_PHONE }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
+          umask 077
+          printf '%s' "$PHONE" > /tmp/sf-bot-phone
+          scp -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 \
+            /tmp/sf-bot-phone root@5.189.159.195:/tmp/sf-bot-phone
+          shred -u /tmp/sf-bot-phone 2>/dev/null || rm -f /tmp/sf-bot-phone
+          # Also ship a small scraper script
+          cat > /tmp/sf-cdp-scrape.py <<'PY'
+          #!/usr/bin/env python3
+          import json, sys, urllib.request
+          try:
+              import websocket
+          except ImportError:
+              import subprocess
+              subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "websocket-client"])
+              import websocket
+
+          def tabs():
+              with urllib.request.urlopen("http://127.0.0.1:9222/json/list", timeout=5) as r:
+                  return json.load(r)
+
+          def eval_expr(ws_url, expr):
+              ws = websocket.create_connection(ws_url, timeout=10)
+              msg_id = 1
+              ws.send(json.dumps({"id": msg_id, "method": "Runtime.evaluate", "params": {
+                  "expression": expr, "returnByValue": True, "awaitPromise": True
+              }}))
+              while True:
+                  raw = ws.recv()
+                  data = json.loads(raw)
+                  if data.get("id") == msg_id:
+                      ws.close()
+                      return data
+              return None
+
+          exprs = [
+              """(() => {
+                const as = Array.from(document.querySelectorAll('a[href]'));
+                const hit = as.find(a => (a.href||'').startsWith('signalcaptcha://'));
+                if (hit) return hit.href;
+                const any = as.map(a => a.href).filter(Boolean);
+                return any.join('\\n');
+              })()""",
+              """(() => {
+                const html = document.documentElement.innerHTML;
+                const m = html.match(/signalcaptcha:\\/\\/[^\\s\"'<>]+/);
+                return m ? m[0] : '';
+              })()""",
+              """(() => location.href)()""",
+          ]
+
+          try:
+              tlist = tabs()
+          except Exception as e:
+              print(f"CDP_LIST_FAIL={e}", file=sys.stderr)
+              sys.exit(3)
+
+          print(f"CDP_TABS={len(tlist)}")
+          for t in tlist:
+              url = t.get("url") or ""
+              title = t.get("title") or ""
+              print(f"TAB url_host={url.split('/')[2] if url.startswith('http') else url[:40]} title={title[:40]}")
+
+          targets = [t for t in tlist if "signalcaptcha" in (t.get("url") or "") or "signalcaptchas" in (t.get("url") or "")]
+          if not targets:
+              targets = [t for t in tlist if t.get("type") == "page" and t.get("webSocketDebuggerUrl")]
+          if not targets:
+              print("NO_CDP_TARGETS", file=sys.stderr)
+              sys.exit(4)
+
+          token = ""
+          for t in targets:
+              ws_url = t.get("webSocketDebuggerUrl")
+              if not ws_url:
+                  continue
+              for expr in exprs:
+                  try:
+                      data = eval_expr(ws_url, expr)
+                      val = (((data or {}).get("result") or {}).get("result") or {}).get("value") or ""
+                      if isinstance(val, str) and "signalcaptcha://" in val:
+                          # take first matching line
+                          for line in val.splitlines():
+                              line = line.strip()
+                              if line.startswith("signalcaptcha://"):
+                                  token = line
+                                  break
+                          if token:
+                              break
+                  except Exception as e:
+                      print(f"EVAL_ERR={type(e).__name__}", file=sys.stderr)
+              if token:
+                  break
+
+          if not token:
+              print("CDP_NO_TOKEN", file=sys.stderr)
+              sys.exit(5)
+
+          out = "/opt/signal-flow/config/last-captcha.token"
+          open(out, "w").write(token + "\n")
+          import os
+          os.chmod(out, 0o600)
+          open("/opt/signal-flow/config/last-captcha.meta", "a").write(
+              f"captured_via=cdp len={len(token)}\n"
+          )
+          print(f"CDP_TOKEN_CAPTURED=1 len={len(token)}")
+          PY
+          scp -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 \
+            /tmp/sf-cdp-scrape.py root@5.189.159.195:/tmp/sf-cdp-scrape.py
+          rm -f /tmp/sf-cdp-scrape.py
+          ssh -o ServerAliveInterval=30 -o ConnectTimeout=30 \
+              -i ~/.ssh/id_ed25519 root@5.189.159.195 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          ACCOUNT_DIR=/opt/signal-flow/bot-signal
+          TOKEN_FILE=/opt/signal-flow/config/last-captcha.token
+          mkdir -p /opt/signal-flow/config
+
+          echo "=== CDP port check ==="
+          ss -lntp | grep -E ':9222\b' || netstat -lntp 2>/dev/null | grep 9222 || echo "WARN: no listener on 9222"
+          curl -sS -m 3 http://127.0.0.1:9222/json/version | head -c 200 || echo "CDP_VERSION_FAIL"
+          echo
+
+          # Ensure websocket-client available
+          python3 -m pip install -q websocket-client 2>/dev/null || pip3 install -q websocket-client 2>/dev/null || true
+          set +e
+          python3 /tmp/sf-cdp-scrape.py
+          CDP_RC=$?
+          set -e
+          echo "cdp_scrape_exit=$CDP_RC"
+
+          if [ ! -s "$TOKEN_FILE" ]; then
+            # Fallback: ask chromedriver-less — try strings on /proc chrome + xclip
+            export DISPLAY=:99
+            [ -f /opt/signal-flow/captcha-session/.Xauthority ] && export XAUTHORITY=/opt/signal-flow/captcha-session/.Xauthority
+            if command -v xclip >/dev/null 2>&1; then
+              clip=$(xclip -selection clipboard -o 2>/dev/null || true)
+              case "$clip" in
+                signalcaptcha://*)
+                  printf '%s\n' "$clip" > "$TOKEN_FILE"; chmod 600 "$TOKEN_FILE"
+                  echo "TOKEN_FROM_CLIPBOARD=1 len=${#clip}"
+                  ;;
+              esac
+            fi
+          fi
+
+          if [ ! -s "$TOKEN_FILE" ]; then
+            echo "NO_TOKEN_AFTER_CDP" >&2
+            # Helpful: list anchors via curl to page won't work (js). Show tabs raw.
+            curl -sS -m 3 http://127.0.0.1:9222/json/list 2>/dev/null | python3 -c 'import sys,json; d=json.load(sys.stdin); print("tabs",len(d));
+          [print(t.get("type"), (t.get("url") or "")[:80]) for t in d]' || true
+            exit 2
+          fi
+
+          echo "TOKEN_FILE_READY=1 len=$(wc -c < "$TOKEN_FILE")"
+          CAPTCHA="$(tr -d '\r\n' < "$TOKEN_FILE")"
+          test -f /tmp/sf-bot-phone || { echo "phone missing" >&2; exit 1; }
+          PHONE="$(cat /tmp/sf-bot-phone)"
+          shred -u /tmp/sf-bot-phone 2>/dev/null || rm -f /tmp/sf-bot-phone
+          command -v signal-cli >/dev/null || { echo "signal-cli missing" >&2; exit 1; }
+          test -d "$ACCOUNT_DIR" || { echo "bot-signal missing" >&2; exit 1; }
+
+          redacted() { sed -E 's/\+?[0-9]{8,15}/[redacted]/g; s/signalcaptcha:\/\/[^[:space:]]+/signalcaptcha:\/\/[redacted]/g'; }
+
+          echo "signal-cli register with CDP captcha"
+          set +e
+          OUT="$(signal-cli --config "$ACCOUNT_DIR" -a "$PHONE" register --captcha "$CAPTCHA" 2>&1)"
+          RC=$?
+          if [ "$RC" -ne 0 ]; then
+            TOK="$CAPTCHA"
+            case "$TOK" in signalcaptcha://*) TOK="${TOK#signalcaptcha://}" ;; esac
+            if [ "$TOK" != "$CAPTCHA" ]; then
+              echo "retry scheme-stripped"
+              OUT="$(signal-cli --config "$ACCOUNT_DIR" -a "$PHONE" register --captcha "$TOK" 2>&1)"
+              RC=$?
+            fi
+          fi
+          set -e
+          echo "$OUT" | redacted
+          echo "register_exit=$RC"
+          if [ "$RC" -eq 0 ]; then
+            echo "SMS_REQUESTED=1"
+            if [ -f /opt/signal-flow/config/bot.json ]; then
+              python3 - /opt/signal-flow/config/bot.json "$PHONE" <<'PY'
+          import json, sys
+          path, phone = sys.argv[1], sys.argv[2]
+          try:
+              data = json.loads(open(path, encoding="utf-8").read())
+          except Exception:
+              data = {}
+          if not isinstance(data, dict):
+              data = {}
+          data["signal_account"] = phone
+          open(path, "w", encoding="utf-8").write(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+          PY
+            fi
+            exit 0
+          fi
+          echo "$OUT" | redacted | grep -qi captcha && echo "NEED_CAPTCHA=1"
+          exit "$RC"
+          REMOTE
+          shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519
