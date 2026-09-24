@@ -3,6 +3,18 @@ name: Deploy to Contabo
 on:
   push:
     branches: [main]
+    paths-ignore:
+      # Ops docs / incident tooling must not rebuild Contabo (16+ min outage).
+      - '**.md'
+      - 'docs/**'
+      - 'website/**'
+      - 'deploy/contabo-ops/**'
+      - '.github/workflows/diagnose-contabo.yml'
+      - '.github/workflows/recover-contabo.yml'
+      - '.github/workflows/kick-contabo-gateways.yml'
+      - '.github/workflows/fix-contabo-telegram-allowlist.yml'
+      - '.github/workflows/probe-contabo-telegram-auth.yml'
+      - '.github/workflows/install-contabo-overlay.yml'
   workflow_dispatch:
 
 jobs:
