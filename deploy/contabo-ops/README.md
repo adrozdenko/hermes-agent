@@ -28,6 +28,14 @@ Volume data lives at `/opt/hermes/data` (never wipe on image update).
    `TELEGRAM_ALLOWED_USERS`. Workflow **Fix Contabo Telegram allowlist**
    patches without rebuild.
 
+4. **Telegram cold-boot keeps offline messages** —
+   `platforms.telegram.extra.drop_pending_on_cold_boot: false` so Contabo
+   delivers DMs sent while the gateway was down. Upstream default is
+   `true` (drop). Workflow **Set Contabo Telegram cold-boot keep** patches
+   config + restarts `gateway-default` without image rebuild. Do **not**
+   create live cron jobs or webhook routes unless Andrii asks; stamp
+   standing awareness into volume MEMORY/SOUL instead (see below).
+
 ## Incident 2026-09-24 (summary)
 
 | Symptom | Cause | Fix |
@@ -48,13 +56,14 @@ Volume `/opt/hermes/data` was **not** wiped.
 | Fix Contabo Telegram allowlist | Restore owner `allow_from` / env |
 | Probe Contabo Telegram auth | Allowlist + pairing + recent connect/block lines |
 | Install Contabo compose overlay | scp CMD overlay to host without image rebuild |
+| Set Contabo Telegram cold-boot keep | `drop_pending_on_cold_boot: false` + awareness note; restart gateway |
 
 ## Deploy to Contabo
 
 - Trigger: push to `main` (path-filtered) or manual dispatch.
 - **Disable** this workflow during an active outage so ops-only pushes do not
   rebuild (16+ min + UID chown). Re-enable after Telegram reply confirmed.
-- Docs / contabo-ops / diagnose-recover-kick-probe workflows are
+- Docs / contabo-ops / diagnose-recover-kick-probe-cold-boot workflows are
   `paths-ignore` so they do not start a Contabo rebuild.
 
 ## Operator checklist (bots down)
@@ -66,3 +75,18 @@ Volume `/opt/hermes/data` was **not** wiped.
 4. Confirm with a fresh Telegram ping (old messages during the outage window
    may stay unread forever).
 5. Keep dashboard stopped if it flaps the gateway.
+
+## Capability awareness (cron / webhook — offer when needed)
+
+Contabo Hermes is **Grok-only Telegram** for Andrii. Cron and webhook ingress
+exist in the product but are **dormant** here: do **not** create cron jobs or
+enable webhook routes unless he has a recurring digest / external HTTPS trigger.
+
+Standing memory on the volume (`MEMORY.md` / `SOUL.md`, default + alfred
+profiles when present) gets an idempotent note
+(`<!-- contabo-capability-awareness:v1 -->`) so the agent can **offer** cron
+or webhook when useful, without nagging. Script:
+[`ensure_capability_awareness.py`](./ensure_capability_awareness.py) (run by
+the cold-boot workflow). Re-runs must not duplicate the marker.
+
+Cold-boot knob script: [`set_telegram_cold_boot.py`](./set_telegram_cold_boot.py).

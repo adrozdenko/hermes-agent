@@ -15,6 +15,7 @@ on:
       - '.github/workflows/fix-contabo-telegram-allowlist.yml'
       - '.github/workflows/probe-contabo-telegram-auth.yml'
       - '.github/workflows/install-contabo-overlay.yml'
+      - '.github/workflows/set-contabo-telegram-cold-boot.yml'
   workflow_dispatch:
 
 jobs:

@@ -1,0 +1,73 @@
+name: Set Contabo Telegram cold-boot keep
+
+on:
+  workflow_dispatch:
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch cold-boot, stamp awareness, restart gateway
+        env:
+          SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
+          HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
+
+          scp -o ConnectTimeout=20 -i ~/.ssh/id_ed25519 \
+            deploy/contabo-ops/set_telegram_cold_boot.py \
+            deploy/contabo-ops/ensure_capability_awareness.py \
+            root@5.189.159.195:/tmp/
+
+          ssh -o ServerAliveInterval=15 -o ServerAliveCountMax=20 \
+              -o TCPKeepAlive=yes -o ConnectTimeout=20 \
+              -i ~/.ssh/id_ed25519 root@5.189.159.195 bash -s <<'REMOTE'
+          set -euo pipefail
+          VOL=/opt/hermes/data
+
+          echo "================ COLD-BOOT PATCH ================"
+          docker cp /tmp/set_telegram_cold_boot.py hermes:/tmp/set_telegram_cold_boot.py
+          docker exec -u 0 hermes python3 /tmp/set_telegram_cold_boot.py
+
+          echo "================ CAPABILITY AWARENESS ================"
+          # Prefer in-container /opt/data (same mount as VOL). Also accept host path.
+          docker cp /tmp/ensure_capability_awareness.py hermes:/tmp/ensure_capability_awareness.py
+          docker exec -u 0 -e DATA_ROOT=/opt/data hermes \
+            python3 /tmp/ensure_capability_awareness.py
+
+          echo "================ RESTART gateway-default ================"
+          docker exec hermes sh -c '
+            PATH="/command:/package/admin/s6/command:$PATH"
+            s6-svc -r /run/service/gateway-default
+            sleep 8
+            s6-svstat /run/service/gateway-default
+            ps -eo pid,args | grep "hermes gateway" | grep -v grep || true
+          '
+          docker exec hermes sh -c 'curl -fsS -m 5 -o /dev/null http://127.0.0.1:11435/health && echo PROXY_OK'
+
+          echo "================ VERIFY drop_pending ================"
+          docker exec hermes sh -c "grep -nE 'drop_pending|cold_boot|telegram:' /opt/data/config.yaml | head -60" || true
+          echo "================ AWARENESS marker files ================"
+          docker exec hermes sh -c '
+            for f in /opt/data/MEMORY.md /opt/data/memory/MEMORY.md /opt/data/SOUL.md \
+                     /opt/data/profiles/default/MEMORY.md /opt/data/profiles/alfred/MEMORY.md \
+                     /opt/data/profiles/default/SOUL.md /opt/data/profiles/alfred/SOUL.md; do
+              [ -f "$f" ] || continue
+              if grep -q "contabo-capability-awareness:v1" "$f"; then
+                echo "HAS_MARKER $f"
+              else
+                echo "NO_MARKER $f"
+              fi
+            done
+          '
+          echo "================ recent telegram connect ================"
+          docker logs --since 2m hermes 2>&1 | grep -iE 'Telegram|Connected to Telegram|Gateway Starting|drop_pending|cold.boot|preserving|dropping' | tail -40 || true
+          echo "cold-boot: done"
+          REMOTE
