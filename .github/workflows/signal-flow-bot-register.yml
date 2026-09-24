@@ -63,9 +63,21 @@ jobs:
           redacted() { sed -E 's/\+?[0-9]{8,15}/[redacted]/g'; }
           echo "signal-cli present; requesting SMS"
           set +e
+          # signal-cli accepts full signalcaptcha:// or token-only; try both on 403.
           if [ -n "$CAPTCHA" ]; then
             OUT="$(signal-cli --config "$ACCOUNT_DIR" -a "$PHONE" register --captcha "$CAPTCHA" 2>&1)"
             RC=$?
+            if [ "$RC" -ne 0 ]; then
+              TOK="$CAPTCHA"
+              case "$TOK" in
+                signalcaptcha://*) TOK="${TOK#signalcaptcha://}" ;;
+              esac
+              if [ "$TOK" != "$CAPTCHA" ]; then
+                echo "retry register with scheme-stripped captcha"
+                OUT="$(signal-cli --config "$ACCOUNT_DIR" -a "$PHONE" register --captcha "$TOK" 2>&1)"
+                RC=$?
+              fi
+            fi
           else
             OUT="$(signal-cli --config "$ACCOUNT_DIR" -a "$PHONE" register 2>&1)"
             RC=$?
