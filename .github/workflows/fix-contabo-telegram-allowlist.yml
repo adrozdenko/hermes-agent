@@ -6,6 +6,7 @@ on:
 jobs:
   fix:
     runs-on: ubuntu-latest
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
       - name: Inspect, patch allowlist, restart gateway
@@ -20,12 +21,12 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
 
-          scp -i ~/.ssh/id_ed25519 \
+          scp -o ConnectTimeout=20 -i ~/.ssh/id_ed25519 \
             deploy/contabo-ops/restore_telegram_allowlist.py \
             root@5.189.159.195:/tmp/restore_telegram_allowlist.py
 
-          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=60 \
-              -o TCPKeepAlive=yes -o ConnectTimeout=30 \
+          ssh -o ServerAliveInterval=15 -o ServerAliveCountMax=20 \
+              -o TCPKeepAlive=yes -o ConnectTimeout=20 \
               -i ~/.ssh/id_ed25519 root@5.189.159.195 bash -s <<'REMOTE'
           set -euo pipefail
           VOL=/opt/hermes/data
@@ -34,21 +35,27 @@ jobs:
           docker exec hermes sh -c 'echo TELEGRAM_ALLOWED_USERS=${TELEGRAM_ALLOWED_USERS:-unset}; echo TELEGRAM_ALLOW_ALL_USERS=${TELEGRAM_ALLOW_ALL_USERS:-unset}'
           echo "-- config snippets --"
           docker exec hermes sh -c "grep -nE 'telegram|allow_from|ALLOWED|unauthorized|321340950' /opt/data/config.yaml | head -100" || true
-          echo "-- volume grep --"
-          grep -RInE 'TELEGRAM_ALLOWED|allow_from|321340950' "$VOL" --include='*.env' --include='*.yaml' --include='*.yml' 2>/dev/null | head -50 || true
-          ls -la "$VOL/backups/config" 2>/dev/null | tail -15 || echo "(no backups)"
+          echo "-- narrow env/config files only --"
+          for f in \
+            "$VOL/config.yaml" \
+            "$VOL/.env" \
+            "$VOL/gateway.env" \
+            "$VOL/secrets/telegram-allow.env" \
+            /opt/hermes/.env \
+            /opt/hermes/docker-compose.yml
+          do
+            [ -f "$f" ] || continue
+            echo "## $f"
+            grep -nE 'TELEGRAM_ALLOWED|allow_from|321340950|unauthorized' "$f" | head -40 || true
+          done
+          ls -la "$VOL/backups/config" 2>/dev/null | tail -10 || echo "(no backups)"
 
           echo "================ APPLY ================"
           docker cp /tmp/restore_telegram_allowlist.py hermes:/tmp/restore_telegram_allowlist.py
           docker exec -u 0 hermes python3 /tmp/restore_telegram_allowlist.py
 
-          # If container env is empty, inject via docker update + recreate is heavy;
-          # instead export into a file sourced by gateway run if present, and also
-          # set on the running process environment through a wrapper is not possible.
-          # Prefer editing config allow_from (done). Also write host-side env for compose.
           mkdir -p "$VOL/secrets"
           echo 'TELEGRAM_ALLOWED_USERS=321340950' > "$VOL/secrets/telegram-allow.env"
-          # Merge into any existing gateway env file if one is used
           for f in "$VOL/.env" "$VOL/gateway.env" /opt/hermes/.env; do
             if [ -f "$f" ]; then
               if grep -q '^TELEGRAM_ALLOWED_USERS=' "$f"; then
