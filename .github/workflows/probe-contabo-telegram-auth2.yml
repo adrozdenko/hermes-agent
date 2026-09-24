@@ -1,0 +1,37 @@
+name: Probe Contabo Telegram auth2
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe
+        env:
+          SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
+          HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
+          ssh -o ConnectTimeout=20 -i ~/.ssh/id_ed25519 root@5.189.159.195 'bash -s' <<'REMOTE'
+set -uo pipefail
+echo "===== telegram platforms yaml (rg) ====="
+docker exec hermes sh -c "grep -n -A20 -E '^[[:space:]]*telegram:|allow_from|TELEGRAM_' /opt/data/config.yaml | head -120"
+echo "===== alfred config telegram ====="
+docker exec hermes sh -c "test -f /opt/data/profiles/alfred/config.yaml && grep -n -A15 -E 'telegram|allow_from' /opt/data/profiles/alfred/config.yaml | head -80 || echo no-alfred-config"
+echo "===== paired / approved ====="
+docker exec hermes sh -c '
+  for f in /opt/data/pairing/*.json /opt/data/platforms/pairing/*.json /opt/data/profiles/alfred/pairing/*.json; do
+    [ -f "$f" ] || continue
+    echo "## $f"; wc -c "$f"; head -c 500 "$f"; echo
+  done
+'
+echo "===== dual telegram adapters / token fight ====="
+docker logs --since 20m hermes 2>&1 | grep -iE 'Blocked unauthorized|replace handoff|Conflict|getUpdates|Connected to Telegram' | tail -40
+echo "===== gateway uptime ====="
+docker exec hermes sh -c 'PATH=/command:$PATH; s6-svstat /run/service/gateway-default; curl -fsS -m 3 -o /dev/null http://127.0.0.1:11435/health && echo PROXY_OK'
+echo done
+
+REMOTE
