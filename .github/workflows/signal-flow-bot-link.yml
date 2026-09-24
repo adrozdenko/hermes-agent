@@ -49,25 +49,29 @@ jobs:
           }
 
           # Idempotent signal-cli install (prefer existing binary).
+          # Asset name is Linux-native (Graal), not Linux-x86_64 — 0.13.20 x86_64 404'd.
           if ! command -v signal-cli >/dev/null 2>&1; then
-            echo "signal-cli missing — installing JRE + signal-cli release"
+            echo "signal-cli missing — installing native release"
             export DEBIAN_FRONTEND=noninteractive
             apt-get update -qq
-            apt-get install -y -qq openjdk-21-jre-headless curl ca-certificates
-            # Pin a known release; bump intentionally when upgrading.
-            SF_CLI_VER="0.13.20"
-            ARCH="$(uname -m)"
-            case "$ARCH" in
-              x86_64|amd64) SF_ARCH=Linux-x86_64 ;;
-              aarch64|arm64) SF_ARCH=Linux-aarch64 ;;
-              *) echo "unsupported arch: $ARCH" >&2; exit 1 ;;
-            esac
+            apt-get install -y -qq curl ca-certificates
+            SF_CLI_VER="0.14.8"
             TMP=$(mktemp -d)
-            URL="https://github.com/AsamK/signal-cli/releases/download/v${SF_CLI_VER}/signal-cli-${SF_CLI_VER}-${SF_ARCH}.tar.gz"
-            echo "fetching signal-cli (URL host only logged)"
+            URL="https://github.com/AsamK/signal-cli/releases/download/v${SF_CLI_VER}/signal-cli-${SF_CLI_VER}-Linux-native.tar.gz"
+            echo "fetching signal-cli native (host logged only)"
             curl -fsSL "$URL" -o "$TMP/signal-cli.tgz"
-            tar -C /opt -xzf "$TMP/signal-cli.tgz"
-            ln -sfn "/opt/signal-cli-${SF_CLI_VER}/bin/signal-cli" /usr/local/bin/signal-cli
+            # Archive layout: signal-cli (binary) at top or under a dir — normalize.
+            mkdir -p "/opt/signal-cli-${SF_CLI_VER}"
+            tar -C "/opt/signal-cli-${SF_CLI_VER}" -xzf "$TMP/signal-cli.tgz"
+            if [ -x "/opt/signal-cli-${SF_CLI_VER}/bin/signal-cli" ]; then
+              BIN="/opt/signal-cli-${SF_CLI_VER}/bin/signal-cli"
+            elif [ -x "/opt/signal-cli-${SF_CLI_VER}/signal-cli" ]; then
+              BIN="/opt/signal-cli-${SF_CLI_VER}/signal-cli"
+            else
+              BIN="$(find "/opt/signal-cli-${SF_CLI_VER}" -type f -name signal-cli | head -n1)"
+            fi
+            test -n "${BIN:-}" && test -x "$BIN" || { echo "signal-cli binary missing after extract" >&2; exit 1; }
+            ln -sfn "$BIN" /usr/local/bin/signal-cli
             rm -rf "$TMP"
           fi
           signal-cli --version || true
