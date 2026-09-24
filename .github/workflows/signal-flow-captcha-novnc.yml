@@ -201,35 +201,27 @@ jobs:
           chmod 600 "$HOME/.vnc/passwd"
           PROFILE="$SESSION_DIR/chrome-profile"
           mkdir -p "$PROFILE"
-          # Expand CHROME_BIN / CAPTCHA_URL / PROFILE into xstartup so the
-          # desktop session owns Chromium (needs a WM — bare grey root was blank).
-          cat > "$HOME/.vnc/xstartup" <<XS
-          #!/bin/sh
-          unset SESSION_MANAGER
-          unset DBUS_SESSION_BUS_ADDRESS
-          xsetroot -solid grey 2>/dev/null || true
-          if command -v dbus-launch >/dev/null 2>&1; then
-            eval "\$(dbus-launch --sh-syntax)" || true
+          # Prefer real chromium binary over chromium-browser wrapper/snap.
+          if [ -x /usr/lib/chromium-browser/chromium-browser ]; then
+            CHROME_BIN=/usr/lib/chromium-browser/chromium-browser
+          elif [ -x /usr/lib/chromium/chromium ]; then
+            CHROME_BIN=/usr/lib/chromium/chromium
+          elif command -v chromium >/dev/null 2>&1; then
+            CHROME_BIN="$(command -v chromium)"
           fi
-          openbox &
-          sleep 2
-          "$CHROME_BIN" \
-            --no-sandbox \
-            --disable-dev-shm-usage \
-            --disable-gpu \
-            --disable-software-rasterizer \
-            --no-first-run \
-            --no-default-browser-check \
-            --disable-translate \
-            --start-maximized \
-            --window-size=1280,800 \
-            --user-data-dir="$PROFILE" \
-            "$CAPTCHA_URL" \
-            >"$SESSION_DIR/chromium.log" 2>&1 &
-          wait
-          XS
-          # Dedent xstartup body (YAML indent leaked into heredoc lines)
-          sed -i 's/^          //' "$HOME/.vnc/xstartup"
+          echo "CHROME_BIN=$CHROME_BIN"
+
+          # xstartup: window manager only. Chrome starts AFTER VNC with DISPLAY set.
+          printf '%s\n' \
+            '#!/bin/sh' \
+            'unset SESSION_MANAGER' \
+            'unset DBUS_SESSION_BUS_ADDRESS' \
+            'xsetroot -solid grey 2>/dev/null || true' \
+            'if command -v dbus-launch >/dev/null 2>&1; then' \
+            '  eval "$(dbus-launch --sh-syntax)" || true' \
+            'fi' \
+            'exec openbox-session' \
+            > "$HOME/.vnc/xstartup"
           chmod +x "$HOME/.vnc/xstartup"
 
           VNC_STARTED=0
@@ -250,14 +242,53 @@ jobs:
             exit 1
           fi
           echo "VNC_STARTED=1 display=:${DISPLAY_NUM} port=${VNC_PORT}"
-          sleep 5
-          # Best-effort chrome pid for status
-          CHROME_PID="$(pgrep -f "signalcaptchas.org" | head -n1 || true)"
-          echo "CHROME_PID=${CHROME_PID:-unknown}"
-          if [ ! -s "$SESSION_DIR/chromium.log" ]; then
-            echo "WARN: chromium.log empty so far" >&2
+          sleep 3
+
+          export DISPLAY=":${DISPLAY_NUM}"
+          # TigerVNC with custom HOME writes auth here
+          if [ -f "$HOME/.Xauthority" ]; then
+            export XAUTHORITY="$HOME/.Xauthority"
+          elif [ -f "/root/.Xauthority" ]; then
+            export XAUTHORITY="/root/.Xauthority"
+          fi
+          unset LD_PRELOAD
+          echo "DISPLAY=$DISPLAY XAUTHORITY=${XAUTHORITY:-unset}"
+          if command -v xdpyinfo >/dev/null 2>&1; then
+            xdpyinfo >/dev/null 2>&1 || echo "WARN: xdpyinfo failed against $DISPLAY" >&2
+          fi
+          # Allow local clients if auth is sticky
+          if command -v xhost >/dev/null 2>&1; then
+            xhost +localhost >/dev/null 2>&1 || true
+            xhost +local: >/dev/null 2>&1 || true
+          fi
+
+          nohup env DISPLAY="$DISPLAY" XAUTHORITY="${XAUTHORITY:-}" LD_PRELOAD= \
+            "$CHROME_BIN" \
+            --no-sandbox \
+            --disable-dev-shm-usage \
+            --disable-gpu \
+            --disable-software-rasterizer \
+            --ozone-platform=x11 \
+            --no-first-run \
+            --no-default-browser-check \
+            --disable-translate \
+            --start-maximized \
+            --window-size=1280,800 \
+            --user-data-dir="$PROFILE" \
+            "$CAPTCHA_URL" \
+            </dev/null >"$SESSION_DIR/chromium.log" 2>&1 &
+          CHROME_PID=$!
+          disown "$CHROME_PID" 2>/dev/null || true
+          echo "CHROME_PID=$CHROME_PID"
+          sleep 4
+          if ! kill -0 "$CHROME_PID" 2>/dev/null; then
+            echo "ERROR: chromium exited early" >&2
+            tail -n 40 "$SESSION_DIR/chromium.log" || true
+            # Keep VNC up so we can still debug; do not hard-fail the tunnel
           else
-            tail -n 15 "$SESSION_DIR/chromium.log" || true
+            echo "chromium still running"
+            # Confirm captcha URL process if wrapper respawned
+            pgrep -af "signalcaptchas|chromium" | head -n 8 || true
           fi
 
           # Bind on all interfaces so phone can use Contabo IP if trycloudflare is blocked.
