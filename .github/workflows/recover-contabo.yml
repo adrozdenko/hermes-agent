@@ -1,0 +1,95 @@
+name: Recover Contabo (restart loop)
+
+# Emergency stabilize: inspect + stop dashboard + restart gateway + wait health.
+# Does NOT rebuild the image. Manual only. Run from any branch so main push
+# does not also fire Deploy to Contabo.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Inspect and stabilize
+        env:
+          SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
+          HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
+          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=40 \
+              -o TCPKeepAlive=yes -o ConnectTimeout=30 \
+              -i ~/.ssh/id_ed25519 root@5.189.159.195 'bash -s' <<'REMOTE'
+          set -uo pipefail
+
+          echo "================ BEFORE ================"
+          docker ps -a --filter name=hermes --format 'table {{.Names}}\t{{.Status}}\t{{.RunningFor}}'
+          for c in hermes hermes-dashboard; do
+            echo "--- $c inspect ---"
+            docker inspect -f 'RestartCount={{.RestartCount}} OOM={{.State.OOMKilled}} Exit={{.State.ExitCode}} Err={{.State.Error}} Started={{.State.StartedAt}} Finished={{.State.FinishedAt}} Health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} RoleEnv={{range .Config.Env}}{{println .}}{{end}}' "$c" 2>&1 | head -40
+          done
+
+          echo
+          echo "================ hermes logs (tail 120) ================"
+          docker logs --tail 120 hermes 2>&1 || true
+
+          echo
+          echo "================ STABILIZE ================"
+          # Dashboard shares /opt/data; if its role gate misses, it fights the
+          # gateway for the claude-proxy log lock and flaps both containers.
+          echo "stopping hermes-dashboard..."
+          docker stop hermes-dashboard 2>&1 || true
+
+          echo "restarting hermes..."
+          docker restart hermes 2>&1 || true
+
+          probe() {
+            docker exec hermes sh -c \
+              'curl -fsS -m 5 -o /dev/null http://127.0.0.1:11435/health 2>/dev/null \
+                 || wget -q -T 5 -O /dev/null http://127.0.0.1:11435/health 2>/dev/null' \
+              2>/dev/null
+          }
+
+          ok=""
+          for i in $(seq 1 60); do  # up to 5 min
+            running=$(docker inspect -f '{{.State.Running}}' hermes 2>/dev/null || echo false)
+            restarting=$(docker inspect -f '{{.State.Restarting}}' hermes 2>/dev/null || echo false)
+            started=$(docker inspect -f '{{.State.StartedAt}}' hermes 2>/dev/null || true)
+            if [ "$running" = "true" ] && [ "$restarting" = "false" ] && probe; then
+              # Require ~45s stable uptime so we don't declare victory mid-flap.
+              if docker exec hermes sh -c 'awk "{print int(\$1)}" /proc/uptime' 2>/dev/null | awk '{exit !($1>=40)}'; then
+                ok=1
+                echo "recover: hermes stable + :11435 OK (attempt $i, started=$started)"
+                break
+              fi
+              echo "recover: health OK but uptime still short (attempt $i)"
+            else
+              last=$(docker logs --tail 1 hermes 2>&1 | tr -d '\r' || true)
+              echo "recover: waiting (attempt $i running=$running restarting=$restarting) [$last]"
+            fi
+            sleep 5
+          done
+
+          if [ -z "$ok" ]; then
+            echo "recover: FAILED to stabilize hermes"
+            docker ps -a --filter name=hermes
+            docker logs --tail 80 hermes 2>&1 || true
+            exit 1
+          fi
+
+          echo "starting hermes-dashboard..."
+          docker start hermes-dashboard 2>&1 || true
+          sleep 10
+
+          echo
+          echo "================ AFTER ================"
+          docker ps -a --filter name=hermes --format 'table {{.Names}}\t{{.Status}}\t{{.RunningFor}}'
+          docker exec hermes sh -c 'curl -fsS -m 5 http://127.0.0.1:11435/health' 2>&1 | head -c 400
+          echo
+          echo "RestartCount hermes=$(docker inspect -f '{{.RestartCount}}' hermes)"
+          echo "recover: done"
+          REMOTE
