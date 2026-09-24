@@ -98,7 +98,7 @@ jobs:
           VNC_PORT=$((5900 + DISPLAY_NUM))
           NOVNC_PORT=6080
           GEOMETRY=1280x800
-          HOLD_SECS=$((35 * 60))
+          HOLD_SECS=$((60 * 60))
           CAPTCHA_URL='https://signalcaptchas.org/registration/generate.html'
 
           mkdir -p "$SESSION_DIR"
@@ -437,14 +437,14 @@ jobs:
           # Schedule auto-teardown on host (prefer systemd-run, else at, else nohup sleep)
           TEARDOWN_SCHED=""
           if command -v systemd-run >/dev/null 2>&1; then
-            if systemd-run --on-active=35min --timer-property=AccuracySec=1s \
+            if systemd-run --on-active=60min --timer-property=AccuracySec=1s \
                 /bin/bash "$SESSION_DIR/teardown.sh" 2>"$SESSION_DIR/teardown-sched.err"; then
-              TEARDOWN_SCHED="systemd-run-35min"
+              TEARDOWN_SCHED="systemd-run-60min"
             fi
           fi
           if [ -z "$TEARDOWN_SCHED" ] && command -v at >/dev/null 2>&1; then
             if echo "bash $SESSION_DIR/teardown.sh" | at now + 20 minutes 2>"$SESSION_DIR/teardown-sched.err"; then
-              TEARDOWN_SCHED="at-35min"
+              TEARDOWN_SCHED="at-60min"
             fi
           fi
           if [ -z "$TEARDOWN_SCHED" ]; then
@@ -535,7 +535,7 @@ jobs:
 
           echo "::notice::NOVNC_URL=${URL}"
           echo "::notice::NOVNC_DIRECT_URL=${DIRECT}"
-          echo "::notice::NOVNC_PASS=${PASS} (one-time VNC password; session ~20 min on Contabo)"
+          echo "::notice::NOVNC_PASS=${PASS} (one-time VNC password; session ~60 min on Contabo)"
           echo "NOVNC_URL=${URL}"
           echo "NOVNC_DIRECT_URL=${DIRECT}"
           echo "NOVNC_PASS=${PASS}"
