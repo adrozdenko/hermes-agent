@@ -1,0 +1,99 @@
+name: Signal Flow bot-register (Contabo SMS)
+
+# Spare-number SMS register for /opt/signal-flow/bot-signal.
+# Phone comes ONLY from secret SIGNAL_FLOW_BOT_PHONE. No workflow inputs
+# (this repo is public). Never echo the number. Does not rebuild Hermes.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  register:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: SMS register bot-signal
+        env:
+          SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
+          HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
+          PHONE: ${{ secrets.SIGNAL_FLOW_BOT_PHONE }}
+          CAPTCHA: ${{ secrets.SIGNAL_FLOW_CAPTCHA }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SSH_KEY:-}" ] || [ -z "${HOST_KEY:-}" ]; then
+            echo "Missing HERMES_SSH_KEY or HERMES_HOST_KEY" >&2
+            exit 1
+          fi
+          if [ -z "${PHONE:-}" ]; then
+            echo "Missing SIGNAL_FLOW_BOT_PHONE secret" >&2
+            exit 1
+          fi
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$HOST_KEY" >> ~/.ssh.known_hosts 2>/dev/null || true
+          printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
+          umask 077
+          printf '%s' "$PHONE" > /tmp/sf-bot-phone
+          if [ -n "${CAPTCHA:-}" ]; then
+            printf '%s' "$CAPTCHA" > /tmp/sf-bot-captcha
+          fi
+          scp -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 \
+            /tmp/sf-bot-phone root@5.189.159.195:/tmp/sf-bot-phone
+          if [ -f /tmp/sf-bot-captcha ]; then
+            scp -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 \
+              /tmp/sf-bot-captcha root@5.189.159.195:/tmp/sf-bot-captcha
+          fi
+          shred -u /tmp/sf-bot-phone /tmp/sf-bot-captcha 2>/dev/null || rm -f /tmp/sf-bot-phone /tmp/sf-bot-captcha
+          ssh -o ServerAliveInterval=30 -o ConnectTimeout=30 \
+              -i ~/.ssh/id_ed25519 root@5.189.159.195 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          DATA_ROOT=/opt/signal-flow
+          ACCOUNT_DIR="$DATA_ROOT/bot-signal"
+          test -d "$ACCOUNT_DIR" || { echo "layout missing bot-signal" >&2; exit 1; }
+          command -v signal-cli >/dev/null || { echo "signal-cli missing on host" >&2; exit 1; }
+          test -f /tmp/sf-bot-phone || { echo "phone file missing" >&2; exit 1; }
+          PHONE="$(cat /tmp/sf-bot-phone)"
+          CAPTCHA=""
+          if [ -f /tmp/sf-bot-captcha ]; then
+            CAPTCHA="$(cat /tmp/sf-bot-captcha)"
+          fi
+          shred -u /tmp/sf-bot-phone /tmp/sf-bot-captcha 2>/dev/null || rm -f /tmp/sf-bot-phone /tmp/sf-bot-captcha
+          redacted() { sed -E 's/\+?[0-9]{8,15}/[redacted]/g'; }
+          echo "signal-cli present; requesting SMS"
+          set +e
+          if [ -n "$CAPTCHA" ]; then
+            OUT="$(signal-cli --config "$ACCOUNT_DIR" -a "$PHONE" register --captcha "$CAPTCHA" 2>&1)"
+            RC=$?
+          else
+            OUT="$(signal-cli --config "$ACCOUNT_DIR" -a "$PHONE" register 2>&1)"
+            RC=$?
+          fi
+          set -e
+          echo "$OUT" | redacted
+          echo "register_exit=$RC"
+          if [ "$RC" -eq 0 ]; then
+            echo "SMS_REQUESTED=1"
+            mkdir -p "$DATA_ROOT/config"
+            # persist account pointer without extra copies of the number in logs
+            if [ -f "$DATA_ROOT/config/bot.json" ]; then
+              python3 - "$DATA_ROOT/config/bot.json" "$PHONE" <<'PY'
+          import json, sys
+          path, phone = sys.argv[1], sys.argv[2]
+          try:
+              data = json.loads(open(path, encoding="utf-8").read())
+          except Exception:
+              data = {}
+          if not isinstance(data, dict):
+              data = {}
+          data["signal_account"] = phone
+          open(path, "w", encoding="utf-8").write(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+          PY
+            fi
+            exit 0
+          fi
+          echo "$OUT" | redacted | grep -qi captcha && echo "NEED_CAPTCHA=1"
+          exit "$RC"
+          REMOTE
+          shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519

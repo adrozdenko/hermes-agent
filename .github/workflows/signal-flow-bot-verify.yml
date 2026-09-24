@@ -1,0 +1,53 @@
+name: Signal Flow bot-verify (Contabo SMS)
+
+# Completes SMS register. Code from secret SIGNAL_FLOW_VERIFY_CODE.
+# Phone from SIGNAL_FLOW_BOT_PHONE. No public inputs. Does not rebuild Hermes.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Verify SMS code
+        env:
+          SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
+          HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
+          PHONE: ${{ secrets.SIGNAL_FLOW_BOT_PHONE }}
+          CODE: ${{ secrets.SIGNAL_FLOW_VERIFY_CODE }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PHONE:-}" ] || [ -z "${CODE:-}" ]; then
+            echo "Missing SIGNAL_FLOW_BOT_PHONE or SIGNAL_FLOW_VERIFY_CODE" >&2
+            exit 1
+          fi
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
+          umask 077
+          printf '%s' "$PHONE" > /tmp/sf-bot-phone
+          printf '%s' "$CODE" > /tmp/sf-bot-code
+          scp -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 \
+            /tmp/sf-bot-phone /tmp/sf-bot-code root@5.189.159.195:/tmp/
+          shred -u /tmp/sf-bot-phone /tmp/sf-bot-code 2>/dev/null || rm -f /tmp/sf-bot-phone /tmp/sf-bot-code
+          ssh -o ServerAliveInterval=30 -o ConnectTimeout=30 \
+              -i ~/.ssh/id_ed25519 root@5.189.159.195 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          ACCOUNT_DIR=/opt/signal-flow/bot-signal
+          PHONE="$(cat /tmp/sf-bot-phone)"
+          CODE="$(cat /tmp/sf-bot-code)"
+          shred -u /tmp/sf-bot-phone /tmp/sf-bot-code 2>/dev/null || rm -f /tmp/sf-bot-phone /tmp/sf-bot-code
+          redacted() { sed -E 's/\+?[0-9]{8,15}/[redacted]/g'; }
+          set +e
+          OUT="$(signal-cli --config "$ACCOUNT_DIR" -a "$PHONE" verify "$CODE" 2>&1)"
+          RC=$?
+          set -e
+          echo "$OUT" | redacted
+          echo "verify_exit=$RC"
+          exit "$RC"
+          REMOTE
+          shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519

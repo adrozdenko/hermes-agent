@@ -20,6 +20,8 @@ on:
       - '.github/workflows/install-signal-flow-layout.yml'
       - '.github/workflows/install-signal-flow-app.yml'
       - '.github/workflows/signal-flow-bot-link.yml'
+      - '.github/workflows/signal-flow-bot-register.yml'
+      - '.github/workflows/signal-flow-bot-verify.yml'
   workflow_dispatch:
 
 jobs:
