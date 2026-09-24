@@ -25,15 +25,25 @@ jobs:
           # long `chmod -R`/`chown -R` stage-2 step). ServerAliveInterval=30 +
           # CountMax=120 tolerates ~60 min of silence before the client gives
           # up. See failed run actions/runs/26861301561.
+          # Pass Actions GITHUB_TOKEN into the remote so Contabo can pull
+          # public ghcr.io base images (anonymous GHCR pulls often hit
+          # "oauth token: denied" under rate limit / cold cache).
           ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=120 \
               -o TCPKeepAlive=yes -o ConnectTimeout=30 \
-              -i ~/.ssh/id_ed25519 root@5.189.159.195 'bash -se' <<'REMOTE'
+              -i ~/.ssh/id_ed25519 root@5.189.159.195 \
+              "export GHCR_TOKEN=$(printf '%q' "$GITHUB_TOKEN"); bash -se" <<'REMOTE'
           set -euo pipefail
           cd /opt/hermes/app
           git config --global --add safe.directory /opt/hermes/app
           git remote set-url origin https://github.com/adrozdenko/hermes-agent.git
           git fetch origin main
           git reset --hard origin/main
+          # Authenticate to GHCR before docker build (uv base image).
+          if [ -n "${GHCR_TOKEN:-}" ]; then
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u adrozdenko --password-stdin
+          else
+            echo "WARN: GHCR_TOKEN empty — build may fail pulling astral-sh/uv" >&2
+          fi
           # --progress=plain keeps a steady output stream during the build,
           # which also helps keep the SSH channel active.
           docker build --progress=plain -t hermes-agent:local .
