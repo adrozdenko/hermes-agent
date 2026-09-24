@@ -16,6 +16,9 @@ on:
       - '.github/workflows/probe-contabo-telegram-auth.yml'
       - '.github/workflows/install-contabo-overlay.yml'
       - '.github/workflows/set-contabo-telegram-cold-boot.yml'
+      # Signal Flow Contabo helpers — never rebuild Hermes
+      - '.github/workflows/install-signal-flow-layout.yml'
+      - '.github/workflows/install-signal-flow-app.yml'
   workflow_dispatch:
 
 jobs:
