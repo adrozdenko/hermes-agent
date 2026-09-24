@@ -2,12 +2,6 @@ name: Recover Contabo (restart loop)
 
 on:
   workflow_dispatch:
-    inputs:
-      mode:
-        description: "quarantine | sleep-cmd | both"
-        type: choice
-        options: [both, sleep-cmd, quarantine]
-        default: both
 
 jobs:
   recover:
@@ -17,77 +11,60 @@ jobs:
         env:
           SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
           HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
-          MODE: ${{ inputs.mode }}
         run: |
-          mkdir -p ~/.ssh && chmod 700 ~/.ssh
-          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
           printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
           ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=60 \
               -o TCPKeepAlive=yes -o ConnectTimeout=30 \
-              -i ~/.ssh/id_ed25519 root@5.189.159.195 \
-              "export MODE=$(printf '%q' "$MODE"); bash -se" <<'REMOTE'
+              -i ~/.ssh/id_ed25519 root@5.189.159.195 bash -s <<'REMOTE'
           set -uo pipefail
 
           echo "================ INSPECT ================"
           docker ps -a --filter name=hermes --format 'table {{.Names}}\t{{.Status}}\t{{.RunningFor}}'
-          for c in hermes hermes-dashboard; do
-            echo "--- $c ---"
-            docker inspect -f 'RestartCount={{.RestartCount}} Exit={{.State.ExitCode}} OOM={{.State.OOMKilled}} Health={{if .State.Health}}{{.State.Health.Status}} fails={{.State.Health.FailingStreak}}{{else}}none{{end}}
-Cmd={{json .Config.Cmd}}
-Entrypoint={{json .Config.Entrypoint}}
-Healthcheck={{json .Config.Healthcheck}}
-Started={{.State.StartedAt}}' "$c" 2>&1 || true
-            echo "Env role/supervise:"
-            docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$c" 2>/dev/null | grep -E 'HERMES_ROLE|HERMES_GATEWAY|SUPERVISE|WATCHDOG|HEALTH' || true
-          done
+          docker inspect -f 'RestartCount={{.RestartCount}} Exit={{.State.ExitCode}} Cmd={{json .Config.Cmd}}' hermes || true
+          docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' hermes 2>/dev/null | grep -E 'HERMES_ROLE|HERMES_GATEWAY|SUPERVISE|WATCHDOG' || true
 
           VOL=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/opt/data"}}{{.Source}}{{end}}{{end}}' hermes 2>/dev/null || true)
           [ -n "$VOL" ] || VOL=/opt/hermes/data
           echo "volume=$VOL"
 
-          if [ "$MODE" = "quarantine" ] || [ "$MODE" = "both" ]; then
-            echo "================ QUARANTINE ================"
-            mkdir -p "$VOL/profiles/_quarantine"
-            if [ -d "$VOL/profiles/.jam-migrated-20260713" ]; then
-              mv "$VOL/profiles/.jam-migrated-20260713" \
-                 "$VOL/profiles/_quarantine/.jam-migrated-20260713.$(date +%s)"
-              echo "quarantined .jam-migrated-20260713"
-            else
-              echo "tombstone already gone"
-            fi
-          fi
-
-          if [ "$MODE" = "sleep-cmd" ] || [ "$MODE" = "both" ]; then
-            echo "================ RECREATE hermes with CMD sleep infinity ================"
-            # Keep image/env/mounts/network; only change Cmd so Contabo no longer runs
-            # a second `hermes gateway run` beside s6 gateway-default (that fight
-            # exits the CMD every ~20s and docker restarts the container).
-            docker stop hermes-dashboard 2>/dev/null || true
-            docker stop hermes 2>/dev/null || true
-
-            # Prefer compose if host files exist
-            if [ -f /opt/hermes/docker-compose.yml ]; then
-              COMPOSE_FILES="-f /opt/hermes/docker-compose.yml"
-              [ -f /opt/hermes/app/docker-compose.prod.yml ] && \
-                COMPOSE_FILES="$COMPOSE_FILES -f /opt/hermes/app/docker-compose.prod.yml"
-              # Override command via ephemeral compose fragment
-              cat > /tmp/hermes-sleep-cmd.yml <<'YML'
-services:
-  gateway:
-    command: ["sleep", "infinity"]
-YML
-              COMPOSE_FILES="$COMPOSE_FILES -f /tmp/hermes-sleep-cmd.yml"
-              echo "compose: docker compose $COMPOSE_FILES up -d gateway"
-              # shellcheck disable=SC2086
-              docker compose $COMPOSE_FILES up -d gateway
-            else
-              echo "FATAL: /opt/hermes/docker-compose.yml missing"
-              exit 1
-            fi
+          echo "================ QUARANTINE ================"
+          mkdir -p "$VOL/profiles/_quarantine"
+          if [ -d "$VOL/profiles/.jam-migrated-20260713" ]; then
+            mv "$VOL/profiles/.jam-migrated-20260713" \
+               "$VOL/profiles/_quarantine/.jam-migrated-20260713.$(date +%s)"
+            echo "quarantined .jam-migrated-20260713"
           else
-            docker stop hermes-dashboard 2>/dev/null || true
-            docker restart hermes
+            echo "tombstone already gone"
           fi
+
+          echo "================ RECREATE gateway CMD=sleep infinity ================"
+          docker stop hermes-dashboard 2>/dev/null || true
+          docker stop hermes 2>/dev/null || true
+
+          if [ ! -f /opt/hermes/docker-compose.yml ]; then
+            echo "FATAL: missing /opt/hermes/docker-compose.yml"
+            exit 1
+          fi
+          COMPOSE_FILES="-f /opt/hermes/docker-compose.yml"
+          if [ -f /opt/hermes/app/docker-compose.prod.yml ]; then
+            COMPOSE_FILES="$COMPOSE_FILES -f /opt/hermes/app/docker-compose.prod.yml"
+          fi
+          cat > /tmp/hermes-sleep-cmd.yml <<'YML'
+          services:
+            gateway:
+              command: ["sleep", "infinity"]
+          YML
+          # strip leading spaces from heredoc for valid compose YAML
+          sed -i 's/^          //' /tmp/hermes-sleep-cmd.yml
+          COMPOSE_FILES="$COMPOSE_FILES -f /tmp/hermes-sleep-cmd.yml"
+          echo "compose files: $COMPOSE_FILES"
+          # shellcheck disable=SC2086
+          docker compose $COMPOSE_FILES up -d gateway
 
           probe() {
             docker exec hermes sh -c \
@@ -105,15 +82,13 @@ YML
             started=$(docker inspect -f '{{.State.StartedAt}}' hermes 2>/dev/null || true)
             rc=$(docker inspect -f '{{.RestartCount}}' hermes 2>/dev/null || echo '?')
             if [ -n "$last_started" ] && [ "$started" != "$last_started" ]; then
-              echo "recover: WARN container restarted (old=$last_started new=$started RestartCount=$rc)"
+              echo "recover: WARN restarted (old=$last_started new=$started rc=$rc)"
               stable=0
             fi
             last_started="$started"
             if [ "$running" = "true" ] && [ "$restarting" = "false" ] && probe; then
-              # Also require gateway process under s6
-              gw=$(docker exec hermes sh -c 'ps -eo args 2>/dev/null | grep -c "[g]ateway run"' 2>/dev/null || echo 0)
               stable=$((stable + 1))
-              echo "recover: health OK streak=$stable/18 gw_procs=$gw rc=$rc (attempt $i)"
+              echo "recover: health OK streak=$stable/18 rc=$rc (attempt $i)"
               if [ "$stable" -ge 18 ]; then
                 ok=1
                 break
@@ -130,22 +105,22 @@ YML
             echo "recover: FAILED"
             docker ps -a --filter name=hermes
             docker logs --tail 150 hermes 2>&1 || true
-            docker inspect -f 'Cmd={{json .Config.Cmd}} Exit={{.State.ExitCode}} Health={{json .State.Health}}' hermes
+            docker inspect -f 'Cmd={{json .Config.Cmd}} RestartCount={{.RestartCount}}' hermes
             exit 1
           fi
 
-          # Leave dashboard down for now if it was part of the fight; try start once
           docker start hermes-dashboard 2>/dev/null || true
           sleep 20
           if ! probe; then
-            echo "recover: dashboard start hurt gateway — leaving it stopped"
+            echo "recover: dashboard hurt gateway — leaving dashboard stopped"
             docker stop hermes-dashboard 2>/dev/null || true
           fi
 
           echo "================ AFTER ================"
           docker ps -a --filter name=hermes --format 'table {{.Names}}\t{{.Status}}\t{{.RunningFor}}'
-          docker inspect -f 'Cmd={{json .Config.Cmd}} RestartCount={{.RestartCount}} Health={{if .State.Health}}{{.State.Health.Status}}{{end}}' hermes
-          docker exec hermes sh -c 'curl -fsS -m 5 http://127.0.0.1:11435/health' 2>&1 | head -c 400; echo
+          docker inspect -f 'Cmd={{json .Config.Cmd}} RestartCount={{.RestartCount}}' hermes
+          docker exec hermes sh -c 'curl -fsS -m 5 http://127.0.0.1:11435/health' 2>&1 | head -c 400
+          echo
           docker exec hermes sh -c 'ps -eo pid,args | grep -iE "gateway run|claude_proxy|sleep infinity" | grep -v grep' 2>&1 || true
           echo "recover: done"
           REMOTE
