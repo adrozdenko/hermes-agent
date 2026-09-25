@@ -1,0 +1,92 @@
+name: Signal Flow wa-live-qr (Contabo)
+# Start/restart WA sidecar + tiny HTTP page that auto-refreshes qr.png.
+# Operator opens URL on a computer, scans with phone WhatsApp Linked devices.
+# Manual only. Does not touch Signal ingest-run.
+on:
+  workflow_dispatch:
+    inputs:
+      clear_session:
+        type: boolean
+        default: true
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Start live QR HTTP on Contabo
+        env:
+          SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
+          HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
+          CLEAR_SESSION: ${{ inputs.clear_session }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
+          ssh -o ConnectTimeout=30 -o ServerAliveInterval=20 -i ~/.ssh/id_ed25519 root@5.189.159.195 \
+            "CLEAR_SESSION=$(printf '%q' "${CLEAR_SESSION:-true}") bash -s" <<'REMOTE'
+          set -euo pipefail
+          DATA_ROOT=/opt/signal-flow
+          APP="$DATA_ROOT/app"
+          SIDE="$APP/whatsapp_sidecar"
+          if [ -d "$DATA_ROOT/users/self" ]; then UDIR="$DATA_ROOT/users/self"
+          else UDIR=$(find "$DATA_ROOT/users" -mindepth 1 -maxdepth 1 -type d | head -n1); fi
+          SESSION="$UDIR/sessions/whatsapp"
+          ATT="$UDIR/data/whatsapp-attachments"
+          CACHE="$SESSION/web-cache"
+          QR_OUT="$SESSION/qr.png"
+          LOG=/tmp/sf-wa-link.log
+          PIDFILE=/tmp/sf-wa-sidecar.pid
+          WWW=/tmp/sf-wa-qr-www
+          HTTPPID=/tmp/sf-wa-qr-http.pid
+          PORT=18080
+          mkdir -p "$SESSION" "$ATT" "$CACHE" "$WWW"
+          CHROME=$(cat "$DATA_ROOT/config/wa_chrome_path" 2>/dev/null || true)
+          [ -n "$CHROME" ] || CHROME=$(command -v chromium-browser || command -v chromium || true)
+          # stop old sidecar + http only
+          [ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE")" 2>/dev/null || true
+          [ -f "$HTTPPID" ] && kill "$(cat "$HTTPPID")" 2>/dev/null || true
+          pkill -f 'whatsapp_sidecar/connector.js' 2>/dev/null || true
+          pkill -f 'sf-wa-qr-www' 2>/dev/null || true
+          sleep 1
+          if [ "${CLEAR_SESSION:-true}" = "true" ]; then
+            find "$SESSION" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+            mkdir -p "$SESSION" "$CACHE"
+          fi
+          rm -f "$QR_OUT" "$LOG"
+          export SF_WA_DATA_DIR="$SESSION" SF_WA_SESSION_DIR="$SESSION" SF_WA_ATTACHMENTS_DIR="$ATT"
+          export SF_WA_CACHE_DIR="$CACHE" SF_WA_CHROME_PATH="$CHROME" SF_WA_HEADLESS=true
+          nohup node "$SIDE/connector.js" >"$LOG" 2>&1 &
+          echo $! >"$PIDFILE"
+          # wait first qr
+          for i in $(seq 1 60); do
+            [ -s "$QR_OUT" ] && break
+            sleep 1
+          done
+          [ -s "$QR_OUT" ] || { echo "NO_QR"; grep -oE '"type":"[a-z_]+"' "$LOG" | sort | uniq -c; exit 1; }
+          # symlink live png + auto-refresh index
+          ln -sfn "$QR_OUT" "$WWW/qr.png"
+          cat > "$WWW/index.html" <<'HTML'
+          <!doctype html><meta charset=utf-8>
+          <title>SF WA QR</title>
+          <meta http-equiv="refresh" content="8">
+          <body style="margin:0;background:#111;color:#eee;font:16px system-ui;text-align:center">
+          <p>WhatsApp → Linked devices → Scan. Page refreshes every 8s.</p>
+          <img id=q src="qr.png?t=0" style="width:min(90vw,720px);height:auto;background:#fff;padding:12px">
+          <script>setInterval(()=>{q.src='qr.png?t='+Date.now()},4000)</script>
+          </body>
+          HTML
+          # open firewall defensively
+          iptables -C INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$PORT" -j ACCEPT || true
+          cd "$WWW"
+          nohup python3 -m http.server "$PORT" --bind 0.0.0.0 > /tmp/sf-wa-qr-http.log 2>&1 &
+          echo $! >"$HTTPPID"
+          sleep 1
+          echo "LIVE_QR_URL=http://5.189.159.195:${PORT}/"
+          echo "sidecar_pid=$(cat "$PIDFILE")"
+          echo "http_pid=$(cat "$HTTPPID")"
+          ls -la "$QR_OUT"
+          echo LIVE_OK=1
+          REMOTE
+          shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519
