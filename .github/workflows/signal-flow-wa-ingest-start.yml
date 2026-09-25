@@ -107,20 +107,42 @@ jobs:
             wa-ingest-run "${USER_ID:-self}" --receive-timeout 2 --idle-sleep 0.5 \
             >"$LOG" 2>&1 &
           echo $! >"$PIDFILE"
-          sleep 5
-          if kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-            echo "WA_INGEST=alive pid=$(cat "$PIDFILE")"
-          else
-            echo "WA_INGEST=dead"
-            # Scrub phones/JIDs from log tail
+          # Wait for Chromium LocalAuth ready (or fail fast on qr/error)
+          READY=0
+          for i in $(seq 1 90); do
+            if ! kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+              echo "WA_INGEST=dead during ready wait"
+              sed -E 's/\+?[0-9]{8,15}/[redacted]/g; s/[0-9]{6,}@(s\.whatsapp\.net|g\.us|lid|newsletter)/[redacted]/gi; /sgnl:\/\//d' "$LOG" | tail -n 40 || true
+              exit 1
+            fi
+            if grep -q 'event=sidecar_ready\|event=sidecar_authenticated' "$LOG" 2>/dev/null                || grep -qE '"type":"(ready|authenticated)"' "$LOG" 2>/dev/null; then
+              READY=1
+              break
+            fi
+            if grep -q 'event=sidecar_qr\|потребує QR\|немає node_modules\|Chromium/Chrome не знайдено' "$LOG" 2>/dev/null; then
+              echo "WA_INGEST=not_bonded_or_misconfigured"
+              sed -E 's/\+?[0-9]{8,15}/[redacted]/g; s/[0-9]{6,}@(s\.whatsapp\.net|g\.us|lid|newsletter)/[redacted]/gi; /sgnl:\/\//d' "$LOG" | tail -n 40 || true
+              exit 1
+            fi
+            sleep 1
+          done
+          if [ "$READY" != 1 ]; then
+            echo "WA_INGEST=ready_timeout"
             sed -E 's/\+?[0-9]{8,15}/[redacted]/g; s/[0-9]{6,}@(s\.whatsapp\.net|g\.us|lid|newsletter)/[redacted]/gi; /sgnl:\/\//d' "$LOG" | tail -n 40 || true
-            exit 1
+            # still running counts as soft-ok if process alive; surface timeout
+            if kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+              echo "WA_INGEST=alive_but_ready_unconfirmed pid=$(cat "$PIDFILE")"
+            else
+              exit 1
+            fi
+          else
+            echo "WA_INGEST=alive pid=$(cat "$PIDFILE") ready=1"
           fi
 
           # Event types only (no bodies)
           echo "=== wa-ingest log event types ==="
           grep -oE '"type":"[a-z_]+"' "$LOG" 2>/dev/null | sort | uniq -c | head -20 || true
-          sed -E 's/\+?[0-9]{8,15}/[redacted]/g; s/[0-9]{6,}@(s\.whatsapp\.net|g\.us|lid|newsletter)/[redacted]/gi; /sgnl:\/\//d' "$LOG" | tail -n 20 || true
+          grep -E 'wa-ingest-run:|event=' "$LOG" 2>/dev/null | tail -n 20 || true
 
           # Re-confirm Signal untouched
           if [ -f "$SIGNALPID" ] && kill -0 "$(cat "$SIGNALPID")" 2>/dev/null; then
