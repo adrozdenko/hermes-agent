@@ -1,0 +1,51 @@
+name: Signal Flow stream-start (Contabo)
+
+on:
+  workflow_dispatch:
+    inputs:
+      group_id:
+        description: "Signal group id (base64 from list-bot-groups) or exact group name"
+        required: true
+        type: string
+
+jobs:
+  start:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: stream-start on Contabo
+        env:
+          SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
+          HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
+          GROUP_REF: ${{ inputs.group_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
+          # Pass group ref via env to remote (no secrets in group names)
+          ssh -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 root@5.189.159.195 \
+            "GROUP_REF=$(printf %q "$GROUP_REF") bash -s" <<'REMOTE'
+          set -euo pipefail
+          DATA_ROOT=/opt/signal-flow
+          APP="$DATA_ROOT/app"
+          INGPID=/tmp/sf-ingest-run.pid
+          if [ -f "$INGPID" ]; then
+            OLD=$(cat "$INGPID" 2>/dev/null || true)
+            [ -n "${OLD:-}" ] && kill -0 "$OLD" 2>/dev/null && kill "$OLD" 2>/dev/null || true
+          fi
+          pkill -f 'sf-admin.*ingest-run' 2>/dev/null || true
+          pkill -f 'signal-cli' 2>/dev/null || true
+          sleep 2
+          echo "=== stream-start ==="
+          "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli stream-start "$GROUP_REF"
+          echo "=== stream-status ==="
+          "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli stream-status
+          nohup env PYTHONUNBUFFERED=1 "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli \
+            ingest-run self --receive-timeout 8 --idle-sleep 1 \
+            >/tmp/sf-ingest-run.log 2>&1 &
+          echo $! >/tmp/sf-ingest-run.pid
+          echo INGEST_RUN=restarted
+          REMOTE
+          shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519
