@@ -56,6 +56,26 @@ jobs:
           pkill -f 'sf-admin.*bot-run' 2>/dev/null || true
           sleep 1
           echo "send_link_qr_start recipient=$RECIPIENT timeout=$LINK_TIMEOUT"
+          # Wipe incomplete self session (empty accounts.json false-positive)
+          "$APP/.venv/bin/python" - <<'PY'
+          import json, shutil, re
+          from pathlib import Path
+          import sys
+          sys.path.insert(0, "/opt/signal-flow/app")
+          from sf.register import resolve_signal_account
+          from sf.bot_link import user_signal_session_dir, is_account_linked
+          from sf.paths import safe_user_id
+          root = Path("/opt/signal-flow")
+          account = resolve_signal_account(root) or "self"
+          sess = user_signal_session_dir(root, account)
+          linked = is_account_linked(sess)
+          print("pre_wipe_linked=", linked, "sess_exists=", sess.is_dir())
+          if sess.is_dir() and not linked:
+              shutil.rmtree(sess)
+              print("wiped_incomplete_session=1")
+          elif sess.is_dir() and linked:
+              print("kept_linked_session=1")
+          PY
           set +e
           "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli \
             send-link-qr "$RECIPIENT" --start-link --timeout "$LINK_TIMEOUT" \
