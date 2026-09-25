@@ -69,7 +69,8 @@ jobs:
           print("vylet_targets=", sorted(air_t), flush=True)
           assert air_t == frozenset({"air"}), air_t
 
-          assert "air" in classify_topics("ворожий дрон над позицією")
+          assert "air" not in classify_topics("ворожий дрон над позицією")
+          assert "air" not in classify_topics("БПЛА на маршруті")
           print("VERIFY_OK", flush=True)
           PY
           REMOTE
