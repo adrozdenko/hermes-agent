@@ -1,0 +1,90 @@
+name: Signal Flow bot-send-probe (Contabo)
+
+# Ops: probe Note-to-Self / self send without printing phones or message bodies.
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe send on Contabo
+        env:
+          SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
+          HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
+          ssh -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 root@5.189.159.195 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          DATA_ROOT=/opt/signal-flow
+          APP="$DATA_ROOT/app"
+          PIDFILE=/tmp/sf-bot-run.pid
+          LOG=/tmp/sf-bot-run.log
+          # Pause listener so config lock is free
+          if [ -f "$PIDFILE" ]; then
+            OLD=$(cat "$PIDFILE" 2>/dev/null || true)
+            if [ -n "${OLD:-}" ] && kill -0 "$OLD" 2>/dev/null; then
+              kill "$OLD" 2>/dev/null || true
+              sleep 1
+            fi
+          fi
+          pkill -f 'sf-admin.*bot-run' 2>/dev/null || true
+          sleep 1
+          "$APP/.venv/bin/python" - <<'PY'
+          import re, subprocess, sys
+          from pathlib import Path
+          sys.path.insert(0, "/opt/signal-flow/app")
+          from sf.register import resolve_signal_account, scrub_log
+          from sf.bot_link import signal_cli_bin, is_account_linked
+          from sf.paths import bot_signal_dir
+          root = Path("/opt/signal-flow")
+          account = resolve_signal_account(root)
+          bin_path = signal_cli_bin()
+          cfg = bot_signal_dir(root)
+          print("linked=", is_account_linked(cfg))
+          print("cli=", bool(bin_path), "account_set=", bool(account))
+          if not bin_path or not account:
+              raise SystemExit(0)
+          help_p = subprocess.run([bin_path, "send", "--help"], capture_output=True, text=True, timeout=30)
+          blob = (help_p.stdout or "") + "\n" + (help_p.stderr or "")
+          has_nts = ("note-to-self" in blob.lower())
+          print("send_help_has_note_to_self=", has_nts)
+          for line in blob.splitlines():
+              low = line.lower()
+              if any(k in low for k in ("note", "self", "recipient", "-m ", "--message")):
+                  print("help:", re.sub(r"\+?\d{8,15}", "[redacted]", line)[:180])
+          body = "Signal Flow тест"
+          trials = []
+          if has_nts:
+              trials.append(("note-to-self", [bin_path, "--config", str(cfg), "-a", account, "send", "--note-to-self", "-m", body]))
+          trials.append(("to-account", [bin_path, "--config", str(cfg), "-a", account, "send", "-m", body, account]))
+          for label, cmd in trials:
+              try:
+                  proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+              except Exception as exc:
+                  print(f"send_{label}=exc {type(exc).__name__}")
+                  continue
+              scrubbed = scrub_log(((proc.stdout or "") + "\n" + (proc.stderr or "")).strip(), account)
+              print(f"send_{label}_rc=", proc.returncode)
+              if scrubbed:
+                  print(f"send_{label}_scrub=", scrubbed[-280:])
+          PY
+          export PYTHONUNBUFFERED=1
+          nohup env PYTHONUNBUFFERED=1 "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli bot-run \
+            >"$LOG" 2>&1 &
+          echo $! > "$PIDFILE"
+          sleep 2
+          if kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+            echo "BOT_RUN=restarted pid=$(cat "$PIDFILE")"
+          else
+            echo "BOT_RUN=restart_failed"
+            tail -n 20 "$LOG" || true
+            exit 1
+          fi
+          REMOTE
+          shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519
