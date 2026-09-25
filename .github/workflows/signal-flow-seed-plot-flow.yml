@@ -123,6 +123,7 @@ jobs:
                       "Шторм",
                   ],
                   "channels_include": list(source_keys),
+                  "keywords_exclude": ["31 мсп", "67 мсд"],
                   "channels_exclude": [],
                   "aoi": [],
               },

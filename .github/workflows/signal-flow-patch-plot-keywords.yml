@@ -48,6 +48,7 @@ jobs:
           if not isinstance(flow.get("filters"), dict):
               flow["filters"] = {}
           flow["filters"]["keywords"] = list(KEYWORDS)
+          flow["filters"]["keywords_exclude"] = ["31 мсп", "67 мсд"]
           # keep channels_include / sources as already seeded
           if not flow.get("name"):
               flow["name"] = "Перехоплення 125"
@@ -55,6 +56,7 @@ jobs:
           f = flow.get("filters") or {}
           print("flow_name=", flow.get("name"), flush=True)
           print("keywords_n=", len(f.get("keywords") or []), flush=True)
+          print("keywords_exclude=", "|".join(f.get("keywords_exclude") or []), flush=True)
           print("keywords=", "|".join(f.get("keywords") or []), flush=True)
           print("channels_include_n=", len(f.get("channels_include") or []), flush=True)
           print("sources_n=", len(flow.get("sources") or []), flush=True)
