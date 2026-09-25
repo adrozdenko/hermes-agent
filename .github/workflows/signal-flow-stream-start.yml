@@ -38,6 +38,15 @@ jobs:
           pkill -f 'sf-admin.*ingest-run' 2>/dev/null || true
           pkill -f 'signal-cli' 2>/dev/null || true
           sleep 2
+          ACC=$(python3 -c "import json;print(json.load(open('$DATA_ROOT/config/bot.json')).get('signal_account') or '')" 2>/dev/null || true)
+          if [ -n "${ACC:-}" ]; then
+            SC=$(command -v signal-cli || echo /usr/local/bin/signal-cli)
+            echo "=== bot-signal receive sync ==="
+            timeout 45 "$SC" -a "$ACC" --config "$DATA_ROOT/bot-signal" receive -t 12 >/tmp/sf-bot-sync.log 2>&1 || true
+            pkill -f 'signal-cli' 2>/dev/null || true
+            sleep 1
+            echo SYNC=done
+          fi
           echo "=== stream-start ==="
           "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli stream-start "$GROUP_REF"
           echo "=== stream-status ==="

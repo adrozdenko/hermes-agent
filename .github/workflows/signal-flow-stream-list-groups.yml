@@ -32,6 +32,15 @@ jobs:
           pkill -f 'sf-admin.*ingest-run' 2>/dev/null || true
           pkill -f 'signal-cli' 2>/dev/null || true
           sleep 2
+          # Sync linked device so new groups (e.g. just created on phone) appear
+          ACC=$(python3 -c "import json;print(json.load(open('$DATA_ROOT/config/bot.json')).get('signal_account') or '')" 2>/dev/null || true)
+          if [ -n "${ACC:-}" ] && [ -x /usr/local/bin/signal-cli ] || command -v signal-cli >/dev/null; then
+            SC=$(command -v signal-cli || echo /usr/local/bin/signal-cli)
+            echo "=== bot-signal receive sync ==="
+            timeout 45 "$SC" -a "$ACC" --config "$DATA_ROOT/bot-signal" receive -t 12 2>/dev/null | sed -E 's/\+?[0-9]{8,15}/[redacted]/g; /sgnl:\/\//d' | tail -n 5 || true
+            pkill -f 'signal-cli' 2>/dev/null || true
+            sleep 1
+          fi
           echo "=== list-bot-groups ==="
           "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli list-bot-groups || true
           # Restart ingest-run (owns delivery while streaming)
