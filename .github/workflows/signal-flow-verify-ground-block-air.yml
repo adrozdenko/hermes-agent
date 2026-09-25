@@ -1,0 +1,83 @@
+name: Signal Flow verify ground-block AIR (Contabo)
+
+# Scrubbed stub: 488 мсп + полет* → not air; 71 опббс + same → air; НВ + вылет → air.
+on:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Verify ground units block keyword→AIR on Contabo
+        env:
+          SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
+          HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
+          ssh -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 root@5.189.159.195 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          DATA_ROOT=/opt/signal-flow
+          APP="$DATA_ROOT/app"
+          echo "=== git tip (installed tree has no .git; show topics SHA via marker) ==="
+          grep -n 'ground-block\|GROUND_UNIT_ABBRS\|keyword→AIR\|keyword.AIR' "$APP/sf/topics.py" | head -20 || true
+          test -f "$APP/sf/topics.py"
+          grep -q 'GROUND_UNIT_ABBRS' "$APP/sf/topics.py"
+          echo "=== processes ==="
+          if [ -f /tmp/sf-ingest-run.pid ] && kill -0 "$(cat /tmp/sf-ingest-run.pid)" 2>/dev/null; then
+            echo INGEST_RUN=alive pid=$(cat /tmp/sf-ingest-run.pid)
+          else
+            echo INGEST_RUN=not_running
+          fi
+          echo "=== scrubbed stub classify ==="
+          export PYTHONUNBUFFERED=1
+          "$APP/.venv/bin/python" -u - <<'PY'
+          import sys
+          sys.path.insert(0, "/opt/signal-flow/app")
+          from sf.topics import classify_stream_targets, classify_topics, GROUND_UNIT_ABBRS
+          from sf.units import extract_units
+
+          assert "мсп" in GROUND_UNIT_ABBRS and "мсд" in GROUND_UNIT_ABBRS
+
+          # 1) ground + полет* → NOT air
+          t1 = (
+              "укх р/м 488 мсп 144 мсд\n"
+              "полетное задание на разведку"
+          )
+          u1 = extract_units(t1)
+          h1 = classify_stream_targets(t1, units=u1)
+          print("probe1_units=", u1, "targets=", sorted(h1), "filter_ok=", "air" not in h1, flush=True)
+          assert "488 мсп" in u1 and "144 мсд" in u1
+          assert "air" in classify_topics(t1)  # keyword would fire
+          assert "air" not in h1, h1
+
+          # 2) air-unit + same → air OK
+          t2 = "71 опббс — полетное задание"
+          u2 = extract_units(t2)
+          h2 = classify_stream_targets(t2, units=u2)
+          print("probe2_units=", u2, "targets=", sorted(h2), "filter_ok=", h2 == frozenset({"air"}), flush=True)
+          assert h2 == frozenset({"air"}), (h2, u2)
+
+          # 3) unitless НВ + вылет → air OK
+          t3 = "укх р/м нв підрозділ\nвылет на маршрут"
+          u3 = extract_units(t3)
+          h3 = classify_stream_targets(t3, units=u3)
+          print("probe3_units=", u3, "targets=", sorted(h3), "filter_ok=", h3 == frozenset({"air"}), flush=True)
+          assert u3 == []
+          assert h3 == frozenset({"air"}), h3
+
+          # 4) ground + arta keyword keeps arta, strips air
+          t4 = "488 мсп — мінометна батарея; следующим полетом"
+          u4 = extract_units(t4)
+          h4 = classify_stream_targets(t4, units=u4)
+          print("probe4_units=", u4, "targets=", sorted(h4), flush=True)
+          assert h4 == frozenset({"arta"}), h4
+
+          print("VERIFY_OK", flush=True)
+          PY
+          REMOTE
+          shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519
