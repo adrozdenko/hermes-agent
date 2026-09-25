@@ -1,0 +1,176 @@
+name: Signal Flow flow-log diag (Contabo)
+
+# Read-only: ingest pid, stream-status, scrubbed flow-log counts. No pkill.
+on:
+  workflow_dispatch:
+    inputs:
+      day:
+        description: "UTC day YYYY-MM-DD (empty = today UTC)"
+        required: false
+        default: ""
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Scrubbed flow-log diag
+        env:
+          SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
+          HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
+          DAY: ${{ inputs.day }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
+          ssh -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 root@5.189.159.195 \
+            "DAY=$(printf %q "${DAY:-}") bash -s" <<'REMOTE'
+          set -euo pipefail
+          DATA_ROOT=/opt/signal-flow
+          APP="$DATA_ROOT/app"
+          echo "=== ingest pid ==="
+          PIDFILE=/tmp/sf-ingest-run.pid
+          if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+            echo INGEST_RUN=alive pid=$(cat "$PIDFILE")
+          else
+            echo INGEST_RUN=dead
+            pgrep -af 'sf-admin.*ingest-run' | sed -E 's/\+?[0-9]{8,15}/[redacted]/g' | head -5 || true
+          fi
+          echo "=== bot-run (should be stopped) ==="
+          if [ -f /tmp/sf-bot-run.pid ] && kill -0 "$(cat /tmp/sf-bot-run.pid)" 2>/dev/null; then
+            echo BOT_RUN=alive
+          else
+            echo BOT_RUN=stopped
+          fi
+          echo "=== stream-status ==="
+          "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli stream-status || true
+          echo "=== flow filters (units only) ==="
+          PYTHONPATH="$APP" "$APP/.venv/bin/python" - <<'PY'
+          import json, re
+          from pathlib import Path
+          from datetime import datetime, timezone
+          root = Path("/opt/signal-flow")
+          # find self user flows
+          users = list((root / "users").glob("*/flows/*.json")) if (root/"users").is_dir() else []
+          # also config paths
+          for p in list((root/"users").glob("*"))[:5] if (root/"users").is_dir() else []:
+              pass
+          # resolve via app
+          import sys
+          sys.path.insert(0, "/opt/signal-flow/app")
+          from sf.flows import ensure_default_flow
+          from sf.ingest import resolve_ingest_user
+          from sf.paths import user_dir
+          sid, _ = resolve_ingest_user(root, "self")
+          flow = ensure_default_flow(root, sid)
+          f = flow.get("filters") or {}
+          print("flow_enabled=", flow.get("enabled"))
+          print("sources=", flow.get("sources"))
+          print("units=", f.get("units"))
+          print("units_exclude=", f.get("units_exclude") or f.get("keywords_exclude"))
+          print("unit_paths_n=", len(f.get("unit_paths") or []))
+          day = (__import__("os").environ.get("DAY") or "").strip()
+          if not day:
+              day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+          print("day=", day)
+          log = user_dir(root, sid) / "data" / "flow-log" / f"{day}.jsonl"
+          print("log_exists=", log.is_file(), "log_size=", log.stat().st_size if log.is_file() else 0)
+          if not log.is_file():
+              # list recent logs
+              d = user_dir(root, sid) / "data" / "flow-log"
+              if d.is_dir():
+                  for x in sorted(d.glob("*.jsonl"))[-5:]:
+                      print("avail=", x.name, "size=", x.stat().st_size)
+              raise SystemExit(0)
+          n=0; matched=0; dropped=0; deduped=0; fp=0; group_ok=0; group_fail=0; no_stream=0
+          sources={}
+          reasons={}
+          unit_hits={}
+          last=[]
+          # also scan for 488 without printing body
+          hit_488=0
+          hit_488_matched=0
+          hit_488_sinks=[]
+          with log.open(encoding="utf-8", errors="replace") as fh:
+              for line in fh:
+                  line=line.strip()
+                  if not line: continue
+                  n+=1
+                  try:
+                      row=json.loads(line)
+                  except Exception:
+                      continue
+                  sk=str(row.get("source") or row.get("source_key") or row.get("channel") or "?")
+                  sk=re.sub(r"\+?\d{8,15}", "[redacted]", sk)
+                  sources[sk]=sources.get(sk,0)+1
+                  ok=bool(row.get("matched") or row.get("match"))
+                  if ok: matched+=1
+                  if row.get("dropped"): dropped+=1
+                  if row.get("deduped") or row.get("dedup"): deduped+=1
+                  if row.get("dedup_fingerprint") or row.get("fingerprint_suppressed"): fp+=1
+                  sinks=row.get("sinks") or row.get("sent_sinks") or []
+                  skipped=row.get("skipped_sinks") or []
+                  if isinstance(sinks, list) and any("group" in str(s).lower() or s in ("default","arta","air","bot_group") for s in sinks):
+                      group_ok+=1
+                  if row.get("group_failed") or any("fail" in str(x).lower() for x in (skipped if isinstance(skipped,list) else [])):
+                      group_fail+=1
+                  rs=row.get("reasons") or row.get("reason") or []
+                  if isinstance(rs, str): rs=[rs]
+                  for r in rs:
+                      r=str(r)[:80]
+                      reasons[r]=reasons.get(r,0)+1
+                      if "488" in r: unit_hits[r]=unit_hits.get(r,0)+1
+                  # detect 488 in meta fields only
+                  blob=json.dumps({k:row.get(k) for k in row if k not in ("text","body","excerpt","card","message")}, ensure_ascii=False)
+                  if "488" in blob or (isinstance(rs,list) and any("488" in str(x) for x in rs)):
+                      hit_488+=1
+                      if ok: hit_488_matched+=1
+                      hit_488_sinks.append({
+                        "matched": ok,
+                        "sinks": sinks,
+                        "skipped": skipped[:5] if isinstance(skipped,list) else skipped,
+                        "reasons": [str(x)[:60] for x in (rs[:3] if isinstance(rs,list) else [])],
+                        "ts": row.get("ts") or row.get("at") or row.get("time"),
+                        "source": sk[:40],
+                      })
+                  last.append({
+                    "ts": row.get("ts") or row.get("at") or row.get("time"),
+                    "matched": ok,
+                    "source": sk[:40],
+                    "reasons": [str(x)[:50] for x in (rs[:2] if isinstance(rs,list) else [])],
+                    "sinks": sinks if isinstance(sinks,list) else str(sinks)[:40],
+                    "skipped": (skipped[:3] if isinstance(skipped,list) else skipped),
+                    "fp": bool(row.get("dedup_fingerprint") or row.get("fingerprint_suppressed")),
+                  })
+          print("rows=", n, "matched=", matched, "dropped=", dropped, "deduped=", deduped, "fp=", fp)
+          print("group_ok_guess=", group_ok, "group_fail_guess=", group_fail)
+          print("hit_488_meta=", hit_488, "hit_488_matched=", hit_488_matched)
+          for sk,c in sorted(sources.items(), key=lambda x:-x[1])[:12]:
+              print(f"source_n={c} source={sk[:60]}")
+          for r,c in sorted(reasons.items(), key=lambda x:-x[1])[:15]:
+              print(f"reason_n={c} reason={r}")
+          print("=== last 12 meta ===")
+          for row in last[-12:]:
+              print(row)
+          print("=== 488 hits meta ===")
+          for row in hit_488_sinks[-10:]:
+              print(row)
+          print("=== ingest log tail ===")
+          import pathlib
+          logp=pathlib.Path("/tmp/sf-ingest-run.log")
+          if logp.is_file():
+              import re as _re
+              lines=logp.read_text(errors="replace").splitlines()[-40:]
+              for ln in lines:
+                  ln=_re.sub(r"\+?\d{8,15}", "[redacted]", ln)
+                  if "sgnl://" in ln: continue
+                  # drop long bodies
+                  if len(ln)>240: ln=ln[:240]+"…"
+                  print(ln)
+          else:
+              print("no ingest log")
+          PY
+          REMOTE
+          shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519
