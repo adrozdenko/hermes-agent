@@ -80,32 +80,56 @@ jobs:
                       flush=True,
                   )
 
+          def account_candidates(cfg: Path, account: str) -> list[tuple[str, str]]:
+              out: list[tuple[str, str]] = []
+              if account:
+                  out.append(("resolve", account))
+              p = cfg / "data" / "accounts.json"
+              if p.is_file():
+                  try:
+                      payload = json.loads(p.read_text(encoding="utf-8"))
+                      for a in (payload.get("accounts") or []):
+                          if not isinstance(a, dict):
+                              continue
+                          num = a.get("number") or ""
+                          uuid = a.get("uuid") or a.get("aci") or ""
+                          if num:
+                              out.append(("json_number", str(num)))
+                          if uuid:
+                              out.append(("json_uuid", str(uuid)))
+                  except Exception:
+                      pass
+              # dedupe by value, keep first label
+              seen = set()
+              uniq = []
+              for label, val in out:
+                  if val in seen:
+                      continue
+                  seen.add(val)
+                  uniq.append((label, val))
+              return uniq
+
           def try_receive(label: str, cfg: Path, account: str, timeout: int = 6) -> None:
               bin_path = signal_cli_bin()
-              print(f"--- receive {label} account_len={len(account)} plus={account.startswith('+')} ---", flush=True)
-              if not bin_path or not account:
-                  print("skip missing bin/account", flush=True)
+              print(f"--- receive {label} ---", flush=True)
+              if not bin_path:
+                  print("skip missing bin", flush=True)
                   return
-              for aflag in (account, account.lstrip("+") if account.startswith("+") else ("+" + account if account.isdigit() else account)):
-                  if not aflag:
-                      continue
+              for kind, aflag in account_candidates(cfg, account):
                   cmd = [bin_path, "-a", aflag, "--config", str(cfg), "-o", "json", "receive", "-t", str(timeout)]
                   try:
                       proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 25)
                   except Exception as exc:
-                      print("exc=", type(exc).__name__, scrub(str(exc)), flush=True)
+                      print("kind=", kind, "exc=", type(exc).__name__, scrub(str(exc)), flush=True)
                       continue
                   out_lines = [ln for ln in (proc.stdout or "").splitlines() if ln.strip()]
                   err = scrub((proc.stderr or "").strip())[-240:]
                   print(
-                      f"a_form_len={len(aflag)} a_plus={aflag.startswith('+')} rc={proc.returncode} "
+                      f"kind={kind} a_len={len(aflag)} a_plus={aflag.startswith('+')} "
+                      f"a_uuidish={('-' in aflag and len(aflag) >= 32)} rc={proc.returncode} "
                       f"stdout_lines={len(out_lines)} stderr={err!r}",
                       flush=True,
                   )
-                  # only try first distinct form that differs
-                  if aflag == account:
-                      continue
-                  break
 
           def list_accounts(label: str, cfg: Path) -> None:
               bin_path = signal_cli_bin()
