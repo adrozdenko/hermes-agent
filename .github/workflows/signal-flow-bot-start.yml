@@ -50,7 +50,8 @@ jobs:
           fi
           pkill -f 'sf-admin.*bot-run' 2>/dev/null || true
           sleep 1
-          nohup "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli bot-run \
+          export PYTHONUNBUFFERED=1
+          nohup env PYTHONUNBUFFERED=1 "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli bot-run \
             >"$LOG" 2>&1 &
           echo $! > "$PIDFILE"
           sleep 2
