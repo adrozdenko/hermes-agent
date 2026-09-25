@@ -1,7 +1,7 @@
 name: Signal Flow seed plot flow (Contabo)
 
 # One default потік: Альманах, Каменярі, Нейтрон 2.0, Блендер 2.0.
-# Gate = channels_include (those groups). No keyword flood-control beyond sources.
+# Gate = channels_include (4 groups) AND keywords (units from 21–22.09 slice).
 on:
   workflow_dispatch:
 
@@ -110,7 +110,18 @@ jobs:
           flow = default_flow(
               sources=list(source_keys),
               filters={
-                  "keywords": [],
+                  "keywords": [
+                      "254 мсп",
+                      "488 мсп",
+                      "283 мсп",
+                      "144 мсд",
+                      "1 мсп",
+                      "2 мсд",
+                      "71 опБпС",
+                      "3 бБпС",
+                      "4 опБпС",
+                      "Шторм",
+                  ],
                   "channels_include": list(source_keys),
                   "channels_exclude": [],
                   "aoi": [],
