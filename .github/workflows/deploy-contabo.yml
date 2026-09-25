@@ -17,12 +17,9 @@ on:
       - '.github/workflows/install-contabo-overlay.yml'
       - '.github/workflows/set-contabo-telegram-cold-boot.yml'
       # Signal Flow Contabo helpers — never rebuild Hermes
-      - '.github/workflows/install-signal-flow-layout.yml'
-      - '.github/workflows/install-signal-flow-app.yml'
-      - '.github/workflows/signal-flow-bot-link.yml'
-      - '.github/workflows/signal-flow-bot-register.yml'
-      - '.github/workflows/signal-flow-bot-verify.yml'
-      - '.github/workflows/signal-flow-captcha-novnc.yml'
+      # (glob covers new ops workflows; missing send-probe earlier caused a full deploy)
+      - '.github/workflows/install-signal-flow-*.yml'
+      - '.github/workflows/signal-flow-*.yml'
   workflow_dispatch:
 
 jobs:
