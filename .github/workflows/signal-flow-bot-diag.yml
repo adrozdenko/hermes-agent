@@ -65,7 +65,7 @@ jobs:
           if not account or not bin_path:
               raise SystemExit(0)
           proc = subprocess.run(
-              [bin_path, "--config", cfg, "-a", account, "receive", "--json", "-t", "8"],
+              [bin_path, "--config", cfg, "-a", account, "-o", "json", "receive", "-t", "8"],
               capture_output=True, text=True, timeout=30,
           )
           # never print stdout bodies — only shape counts + stderr scrubbed
