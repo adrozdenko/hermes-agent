@@ -39,31 +39,23 @@ jobs:
           sys.path.insert(0, "/opt/signal-flow/app")
           from sf.delivery import send_to_group
           from sf.bot_link import BotLinkError
+          from sf.stream import TARGET_KEYS, load_stream_state, short_group_id
+
           root = Path("/opt/signal-flow")
           target = os.environ.get("TARGET", "default").strip() or "default"
-          # stream.json shape: {users:{self:{flows:{...:{stream:{sinks:{...}}}}}}} vary — find enabled sinks
-          candidates = list(root.glob("users/*/flows/*/stream.json"))
-          if not candidates:
-              candidates = list(root.glob("**/stream.json"))
-          print("stream_files", len(candidates))
+          if target not in TARGET_KEYS:
+              print("bad_target", target)
+              raise SystemExit(2)
+
+          # Canonical path: bot-signal/stream.json (NOT users/*/flows/*/stream.json)
+          sp = root / "bot-signal" / "stream.json"
+          print("stream_file", sp.as_posix(), "exists", sp.is_file())
+          st = load_stream_state(root)
           sinks = {}
-          for sp in candidates:
-              try:
-                  data = json.loads(sp.read_text())
-              except Exception:
-                  continue
-              # tolerate nested shapes
-              blob = data
-              for k in ("stream", "sinks"):
-                  if isinstance(blob, dict) and k in blob:
-                      blob = blob[k]
-              if isinstance(blob, dict) and "sinks" in blob:
-                  blob = blob["sinks"]
-              if not isinstance(blob, dict):
-                  continue
-              for key, val in blob.items():
-                  if isinstance(val, dict) and val.get("enabled") and val.get("group_id"):
-                      sinks[key] = val
+          for key in TARGET_KEYS:
+              t = st["targets"][key]
+              if bool(t.get("enabled")) and str(t.get("group_id") or "").strip():
+                  sinks[key] = t
           print("enabled_sinks", sorted(sinks.keys()))
           if target not in sinks:
               print("missing_target", target)
@@ -71,7 +63,12 @@ jobs:
           dest = sinks[target]
           gid = dest["group_id"]
           gname = dest.get("group_name") or "?"
-          print("target", target, "group_name", gname, "gid_len", len(gid))
+          print(
+              "target", target,
+              "group_name", re.sub(r"\+?\d{8,15}", "[redacted]", str(gname)),
+              "id_short", short_group_id(gid),
+              "gid_len", len(gid),
+          )
           body = f"Signal Flow smoke {target}"
           try:
               res = send_to_group(root, gid, body)

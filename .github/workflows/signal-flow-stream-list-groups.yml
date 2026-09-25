@@ -1,5 +1,7 @@
 name: Signal Flow stream-list-groups (Contabo)
 
+# Safe list + name refresh after renames. NEVER stream-stop on miss
+# (that previously disabled all 3 sinks when INSOMNIAC was hardcoded).
 on:
   workflow_dispatch:
 
@@ -8,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
-      - name: list-bot-groups on Contabo
+      - name: list-bot-groups on Contabo (no stop on miss)
         env:
           SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
           HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
@@ -18,7 +20,166 @@ jobs:
           printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
-          SCRIPT_B64='c2V0IC1ldW8gcGlwZWZhaWwKREFUQV9ST09UPS9vcHQvc2lnbmFsLWZsb3cKQVBQPSIkREFUQV9ST09UL2FwcCIKSU5HUElEPS90bXAvc2YtaW5nZXN0LXJ1bi5waWQKaWYgWyAtZiAiJElOR1BJRCIgXTsgdGhlbiBPTEQ9JChjYXQgIiRJTkdQSUQiIDI+L2Rldi9udWxsIHx8IHRydWUpOyBbIC1uICIke09MRDotfSIgXSAmJiBraWxsIC0wICIkT0xEIiAyPi9kZXYvbnVsbCAmJiBraWxsICIkT0xEIiAyPi9kZXYvbnVsbCB8fCB0cnVlOyBmaQpwa2lsbCAtZiAnc2YtYWRtaW4uKmluZ2VzdC1ydW4nIDI+L2Rldi9udWxsIHx8IHRydWUKcGtpbGwgLWYgJ3NpZ25hbC1jbGknIDI+L2Rldi9udWxsIHx8IHRydWUKc2xlZXAgMgpjZCAiJEFQUCIKUFlUSE9OUEFUSD0iJEFQUCIgIiRBUFAvLnZlbnYvYmluL3B5dGhvbiIgLSA8PCdQWScKZnJvbSBwYXRobGliIGltcG9ydCBQYXRoCmZyb20gc2YucmVnaXN0ZXIgaW1wb3J0IHJlc29sdmVfc2lnbmFsX2FjY291bnQsIHBlcnNpc3Rfc2lnbmFsX2FjY291bnQsIGNvbmZpZ3VyZWRfc2lnbmFsX2FjY291bnQKcm9vdCA9IFBhdGgoIi9vcHQvc2lnbmFsLWZsb3ciKQphY2MgPSByZXNvbHZlX3NpZ25hbF9hY2NvdW50KHJvb3QpCmlmIGFjYyBhbmQgbm90IGNvbmZpZ3VyZWRfc2lnbmFsX2FjY291bnQocm9vdCk6CiAgICBwZXJzaXN0X3NpZ25hbF9hY2NvdW50KHJvb3QsIGFjYykKICAgIHByaW50KCJQRVJTSVNURUQ9MSIpCmVsaWYgYWNjOgogICAgcHJpbnQoIlBFUlNJU1RFRD0wIikKZWxzZToKICAgIHByaW50KCJQRVJTSVNURUQ9bWlzc2luZyIpCnByaW50KCJBQ0NfU0VUPXllcyIgaWYgYWNjIGVsc2UgIkFDQ19TRVQ9bm8iKQpQWQpOVU1CRVI9JChQWVRIT05QQVRIPSIkQVBQIiAiJEFQUC8udmVudi9iaW4vcHl0aG9uIiAtYyAiZnJvbSBwYXRobGliIGltcG9ydCBQYXRoOyBmcm9tIHNmLnJlZ2lzdGVyIGltcG9ydCByZXNvbHZlX3NpZ25hbF9hY2NvdW50OyBwcmludChyZXNvbHZlX3NpZ25hbF9hY2NvdW50KFBhdGgoJy9vcHQvc2lnbmFsLWZsb3cnKSkgb3IgJycpIikKU0M9IiIKZm9yIGMgaW4gL29wdC9zaWduYWwtZmxvdy9iaW4vc2lnbmFsLWNsaSAvdXNyL2xvY2FsL2Jpbi9zaWduYWwtY2xpIC91c3IvYmluL3NpZ25hbC1jbGk7IGRvCiAgWyAteCAiJGMiIF0gJiYgU0M9JGMgJiYgYnJlYWsKZG9uZQpTQz0ke1NDOi0kKGNvbW1hbmQgLXYgc2lnbmFsLWNsaSB8fCB0cnVlKX0KZWNobyAiU0lHTkFMX0NMST0ke1NDOi1taXNzaW5nfSIKaWYgWyAtbiAiJHtOVU1CRVI6LX0iIF0gJiYgWyAtbiAiJHtTQzotfSIgXTsgdGhlbgogIGVjaG8gIj09PSByZWNlaXZlIDMwcyA9PT0iCiAgc2V0ICtlCiAgdGltZW91dCA3MCAiJFNDIiAtYSAiJE5VTUJFUiIgLS1jb25maWcgIiREQVRBX1JPT1QvYm90LXNpZ25hbCIgcmVjZWl2ZSAtdCAzMCA+L3RtcC9zZi1yZWN2LmxvZyAyPiYxCiAgZWNobyAiUkVDVl9SQz0kPyIKICBzZXQgLWUKICBzZWQgLUUgJ3MvXCs/WzAtOV17OCwxNX0vW3JlZGFjdGVkXS9nOyAvc2dubDpcL1wvL2QnIC90bXAvc2YtcmVjdi5sb2cgfCBncmVwIC1FaSAnZ3JvdXB8aW5zb21uaXxlcnJvcnxFeGNlcHRpb258U3luY2VkfEZhaWxlZCcgfCBoZWFkIC00MCB8fCB0cnVlCiAgZWNobyAiUkVDVl9MSU5FUz0kKHdjIC1sIDwgL3RtcC9zZi1yZWN2LmxvZykiCiAgcGtpbGwgLWYgJ3NpZ25hbC1jbGknIDI+L2Rldi9udWxsIHx8IHRydWUKICBzbGVlcCAxCiAgZWNobyAiPT09IGxpc3RHcm91cHMgPT09IgogIHNldCArZQogIHRpbWVvdXQgOTAgIiRTQyIgLWEgIiROVU1CRVIiIC0tY29uZmlnICIkREFUQV9ST09UL2JvdC1zaWduYWwiIC1vIGpzb24gbGlzdEdyb3VwcyA+L3RtcC9zZi1sZy5qc29uIDI+L3RtcC9zZi1sZy5lcnIKICBlY2hvICJMSVNUX1JDPSQ/IgogIHNldCAtZQogIFBZVEhPTlBBVEg9IiRBUFAiICIkQVBQLy52ZW52L2Jpbi9weXRob24iIC0gPDwnUFknCmltcG9ydCBqc29uLCByZQpmcm9tIHBhdGhsaWIgaW1wb3J0IFBhdGgKcmF3ID0gUGF0aCgiL3RtcC9zZi1sZy5qc29uIikucmVhZF90ZXh0KCkuc3RyaXAoKQplcnIgPSBQYXRoKCIvdG1wL3NmLWxnLmVyciIpLnJlYWRfdGV4dCgpLnN0cmlwKCkKc2NydWIgPSBsYW1iZGEgczogcmUuc3ViKHIiXCs/XGR7OCwxNX0iLCAiW3JlZGFjdGVkXSIsIHMpCnByaW50KCJFUlIiLCBzY3J1YihlcnIpWzozMDBdIGlmIGVyciBlbHNlICIiKQpwcmludCgiUkFXX0xFTiIsIGxlbihyYXcpKQpkYXRhID0gW10KaWYgcmF3OgogICAgdHJ5OgogICAgICAgIGRhdGEgPSBqc29uLmxvYWRzKHJhdykKICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZToKICAgICAgICBwcmludCgiUEFSU0UiLCBlKQogICAgICAgIGRhdGEgPSBbXQppZiBpc2luc3RhbmNlKGRhdGEsIGRpY3QpOgogICAgZGF0YSA9IGRhdGEuZ2V0KCJncm91cHMiKSBvciBkYXRhLmdldCgicmVzdWx0Iikgb3IgW10KcHJpbnQoIkNPVU5UIiwgbGVuKGRhdGEpIGlmIGlzaW5zdGFuY2UoZGF0YSwgbGlzdCkgZWxzZSB0eXBlKGRhdGEpKQpoaXQgPSBOb25lCmlmIGlzaW5zdGFuY2UoZGF0YSwgbGlzdCk6CiAgICBmb3IgZyBpbiBkYXRhOgogICAgICAgIGlmIG5vdCBpc2luc3RhbmNlKGcsIGRpY3QpOgogICAgICAgICAgICBjb250aW51ZQogICAgICAgIG4gPSBnLmdldCgibmFtZSIpIG9yIGcuZ2V0KCJ0aXRsZSIpIG9yICIiCiAgICAgICAgaSA9IHN0cihnLmdldCgiaWQiKSBvciBnLmdldCgiZ3JvdXBJZCIpIG9yICIiKQogICAgICAgIHByaW50KCJHUk9VUCIsIHJlcHIobiksIChpWzoyMF0gKyAi4oCmIikgaWYgbGVuKGkpID4gMjAgZWxzZSBpKQogICAgICAgIGlmIHN0cihuKS5zdHJpcCgpLnVwcGVyKCkgPT0gIklOU09NTklBQyI6CiAgICAgICAgICAgIGhpdCA9IGcKaWYgaGl0OgogICAgZ2lkID0gc3RyKGhpdC5nZXQoImlkIikgb3IgaGl0LmdldCgiZ3JvdXBJZCIpIG9yICIiKQogICAgUGF0aCgiL3RtcC9zZi1pbnNvbW5pYWMtaWQiKS53cml0ZV90ZXh0KGdpZCkKICAgIHByaW50KCJISVRfSU5TT01OSUFDPTEiKQplbHNlOgogICAgcHJpbnQoIkhJVF9JTlNPTU5JQUM9MCIpClBZCmZpCmVjaG8gIj09PSBzZi1hZG1pbiBsaXN0LWJvdC1ncm91cHMgPT09IgoiJEFQUC8udmVudi9iaW4vc2YtYWRtaW4iIC0tZGF0YS1yb290ICIkREFUQV9ST09UIiAtLWZvcmNlLWFkbWluLWNsaSBsaXN0LWJvdC1ncm91cHMgfHwgdHJ1ZQppZiBbIC1mIC90bXAvc2YtaW5zb21uaWFjLWlkIF0gJiYgWyAtcyAvdG1wL3NmLWluc29tbmlhYy1pZCBdOyB0aGVuCiAgR0lEPSQoY2F0IC90bXAvc2YtaW5zb21uaWFjLWlkKQogIGVjaG8gIj09PSBzdHJlYW0tc3RhcnQgcmVhbCBpZCA9PT0iCiAgIiRBUFAvLnZlbnYvYmluL3NmLWFkbWluIiAtLWRhdGEtcm9vdCAiJERBVEFfUk9PVCIgLS1mb3JjZS1hZG1pbi1jbGkgc3RyZWFtLXN0YXJ0ICIkR0lEIgplbHNlCiAgZWNobyAiPT09IHN0cmVhbS1zdG9wIGZha2UgbmFtZSB0YXJnZXQgPT09IgogICIkQVBQLy52ZW52L2Jpbi9zZi1hZG1pbiIgLS1kYXRhLXJvb3QgIiREQVRBX1JPT1QiIC0tZm9yY2UtYWRtaW4tY2xpIHN0cmVhbS1zdG9wIHx8IHRydWUKZmkKIiRBUFAvLnZlbnYvYmluL3NmLWFkbWluIiAtLWRhdGEtcm9vdCAiJERBVEFfUk9PVCIgLS1mb3JjZS1hZG1pbi1jbGkgc3RyZWFtLXN0YXR1cyB8fCB0cnVlCnJtIC1mIC90bXAvc2YtaW5zb21uaWFjLWlkCm5vaHVwIGVudiBQWVRIT05VTkJVRkZFUkVEPTEgIiRBUFAvLnZlbnYvYmluL3NmLWFkbWluIiAtLWRhdGEtcm9vdCAiJERBVEFfUk9PVCIgLS1mb3JjZS1hZG1pbi1jbGkgaW5nZXN0LXJ1biBzZWxmIC0tcmVjZWl2ZS10aW1lb3V0IDggLS1pZGxlLXNsZWVwIDEgPi90bXAvc2YtaW5nZXN0LXJ1bi5sb2cgMj4mMSAmCmVjaG8gJCEgPi90bXAvc2YtaW5nZXN0LXJ1bi5waWQKZWNobyBJTkdFU1RfUlVOPXJlc3RhcnRlZAo='
-          echo "$SCRIPT_B64" | base64 -d > /tmp/sf-remote.sh
-          ssh -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 root@5.189.159.195 'bash -s' < /tmp/sf-remote.sh
+          ssh -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 root@5.189.159.195 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          DATA_ROOT=/opt/signal-flow
+          APP="$DATA_ROOT/app"
+          INGPID=/tmp/sf-ingest-run.pid
+          if [ -f "$INGPID" ]; then
+            OLD=$(cat "$INGPID" 2>/dev/null || true)
+            [ -n "${OLD:-}" ] && kill -0 "$OLD" 2>/dev/null && kill "$OLD" 2>/dev/null || true
+          fi
+          pkill -f 'sf-admin.*ingest-run' 2>/dev/null || true
+          pkill -f 'signal-cli' 2>/dev/null || true
+          sleep 2
+
+          echo "=== stream-status (before) ==="
+          "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli stream-status || true
+
+          echo "=== list-bot-groups ==="
+          set +e
+          "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli list-bot-groups --json >/tmp/sf-lg-admin.json 2>/tmp/sf-lg-admin.err
+          LIST_RC=$?
+          set -e
+          echo "LIST_RC=$LIST_RC"
+          head -c 400 /tmp/sf-lg-admin.err 2>/dev/null | sed -E 's/\+?[0-9]{8,15}/[redacted]/g' || true
+
+          PYTHONPATH="$APP" "$APP/.venv/bin/python" - <<'PY'
+          import json, re, sys
+          from pathlib import Path
+
+          sys.path.insert(0, "/opt/signal-flow/app")
+          from sf.stream import (
+              TARGET_KEYS,
+              load_stream_state,
+              save_stream_state,
+              short_group_id,
+          )
+
+          root = Path("/opt/signal-flow")
+          scrub = lambda s: re.sub(r"\+?\d{8,15}", "[redacted]", s or "")
+
+          # Known post-rename display names (plus legacy) — match only, never stop.
+          KNOWN_NAMES = {
+              "default": {
+                  "потік",
+                  "insomniac",
+              },
+              "arta": {
+                  "потік - вогонь",
+                  "insomniac arta",
+                  "insomniac — вогонь",
+              },
+              "air": {
+                  "потік - повітря",
+                  "insomniac air",
+                  "insomniac — повітря",
+              },
+          }
+
+          groups = []
+          raw_path = Path("/tmp/sf-lg-admin.json")
+          if raw_path.is_file() and raw_path.stat().st_size:
+              try:
+                  data = json.loads(raw_path.read_text(encoding="utf-8"))
+                  if isinstance(data, list):
+                      groups = data
+                  elif isinstance(data, dict):
+                      groups = data.get("groups") or data.get("result") or []
+              except Exception as exc:
+                  print("PARSE_ERR", scrub(str(exc))[:200])
+
+          print("GROUP_COUNT", len(groups) if isinstance(groups, list) else 0)
+          by_id = {}
+          by_name = {}
+          if isinstance(groups, list):
+              for g in groups:
+                  if not isinstance(g, dict):
+                      continue
+                  gid = str(g.get("id") or g.get("groupId") or "").strip()
+                  name = str(g.get("name") or g.get("title") or "").strip()
+                  if gid:
+                      by_id[gid] = name
+                  if name:
+                      by_name[name.casefold()] = gid
+                  print(
+                      "GROUP",
+                      scrub(repr(name)),
+                      short_group_id(gid) if gid else "—",
+                  )
+
+          st = load_stream_state(root)
+          changed = False
+          for key in TARGET_KEYS:
+              t = st["targets"][key]
+              gid = str(t.get("group_id") or "").strip()
+              gname = str(t.get("group_name") or "").strip()
+              enabled = bool(t.get("enabled")) and bool(gid)
+              print(
+                  f"SINK {key} enabled={enabled} "
+                  f"name={scrub(gname)!r} id_short={short_group_id(gid) if gid else '—'}"
+              )
+              if not gid:
+                  if enabled:
+                      print(f"WARN {key}: enabled but empty group_id — leaving as-is")
+                  continue
+
+              # Prefer match by existing group_id (rename-safe).
+              if gid in by_id:
+                  new_name = by_id[gid]
+                  if new_name and new_name != gname:
+                      print(f"REFRESH_NAME {key}: {scrub(gname)!r} → {scrub(new_name)!r}")
+                      st["targets"][key]["group_name"] = new_name
+                      changed = True
+                  else:
+                      print(f"OK {key}: id still present in listGroups")
+                  continue
+
+              # Fallback: known / current display names → same id only if found.
+              candidates = set(KNOWN_NAMES.get(key, set()))
+              if gname:
+                  candidates.add(gname.casefold())
+              hit_gid = None
+              hit_name = None
+              for cand in candidates:
+                  if cand in by_name:
+                      hit_gid = by_name[cand]
+                      hit_name = by_id.get(hit_gid, cand)
+                      break
+              if hit_gid and hit_gid == gid:
+                  print(f"OK {key}: matched by name, id unchanged")
+                  if hit_name and hit_name != gname:
+                      st["targets"][key]["group_name"] = hit_name
+                      changed = True
+              elif hit_gid and hit_gid != gid:
+                  print(
+                      f"WARN {key}: name matched different id_short="
+                      f"{short_group_id(hit_gid)} — NOT rewriting "
+                      f"(kept id_short={short_group_id(gid)}); no stream-stop"
+                  )
+              else:
+                  print(
+                      f"WARN {key}: group_id not in listGroups (miss/race/rename). "
+                      f"Leaving sink enabled={enabled}; NO stream-stop"
+                  )
+
+          if changed:
+              save_stream_state(root, st)
+              print("STATE_SAVED=1")
+          else:
+              print("STATE_SAVED=0")
+          print("NO_STREAM_STOP=1")
+          PY
+
+          echo "=== stream-status (after) ==="
+          "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli stream-status || true
+
+          nohup env PYTHONUNBUFFERED=1 "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli \
+            ingest-run self --receive-timeout 8 --idle-sleep 1 \
+            >/tmp/sf-ingest-run.log 2>&1 &
+          echo $! >/tmp/sf-ingest-run.pid
+          echo INGEST_RUN=restarted
+          pkill -f 'sf-admin.*bot-run' 2>/dev/null || true
+          echo BOT_RUN=stopped
+          REMOTE
           shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519
