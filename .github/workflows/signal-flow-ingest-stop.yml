@@ -28,7 +28,7 @@ jobs:
             [ -n "${OLD:-}" ] && kill -0 "$OLD" 2>/dev/null && kill "$OLD" 2>/dev/null || true
             rm -f "$PIDFILE"
           fi
-          pkill -f 'sf-admin.*ingest-run' 2>/dev/null || true
+          pkill -f 'sf-admin.* ingest-run' 2>/dev/null || true
           sleep 1
           nohup env PYTHONUNBUFFERED=1 "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli bot-run \
             >/tmp/sf-bot-run.log 2>&1 &

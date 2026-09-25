@@ -44,7 +44,7 @@ jobs:
             OLD=$(cat "$INGPID" 2>/dev/null || true)
             [ -n "${OLD:-}" ] && kill -0 "$OLD" 2>/dev/null && kill "$OLD" 2>/dev/null || true
           fi
-          pkill -f 'sf-admin.*ingest-run' 2>/dev/null || true
+          pkill -f 'sf-admin.* ingest-run' 2>/dev/null || true
           pkill -f 'signal-cli' 2>/dev/null || true
           sleep 2
           ACC=$(python3 -c "import json;print(json.load(open('/opt/signal-flow/config/bot.json')).get('signal_account') or '')")

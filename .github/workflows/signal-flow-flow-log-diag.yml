@@ -36,7 +36,7 @@ jobs:
             echo INGEST_RUN=alive pid=$(cat "$PIDFILE")
           else
             echo INGEST_RUN=dead
-            pgrep -af 'sf-admin.*ingest-run' | sed -E 's/\+?[0-9]{8,15}/[redacted]/g' | head -5 || true
+            pgrep -af 'sf-admin.* ingest-run' | sed -E 's/\+?[0-9]{8,15}/[redacted]/g' | head -5 || true
           fi
           echo "=== bot-run (should be stopped) ==="
           if [ -f /tmp/sf-bot-run.pid ] && kill -0 "$(cat /tmp/sf-bot-run.pid)" 2>/dev/null; then
