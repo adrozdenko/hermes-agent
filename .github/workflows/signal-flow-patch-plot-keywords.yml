@@ -1,6 +1,7 @@
 name: Signal Flow patch plot keywords (Contabo)
 
-# Patch keywords on default flow «Перехоплення 125» without killing ingest-run.
+# Patch filters.units on default flow «Перехоплення 125» without killing ingest-run.
+# Includes 856 сап + bare гадн (Almanac «гадн 254 мсп …»).
 on:
   workflow_dispatch:
 
@@ -39,6 +40,8 @@ jobs:
               "71 опБпС",
               "3 бБпС",
               "4 опБпС",
+              "856 сап",
+              "гадн",
               "Шторм",
           ]
 
