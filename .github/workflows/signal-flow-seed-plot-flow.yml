@@ -1,0 +1,130 @@
+name: Signal Flow seed plot flow (Contabo)
+
+# One default потік: Альманах, Каменярі, Нейтрон 2.0, Блендер 2.0.
+# Gate = channels_include (those groups). No keyword flood-control beyond sources.
+on:
+  workflow_dispatch:
+
+jobs:
+  seed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Seed channels + default flow
+        env:
+          SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
+          HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
+          ssh -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 root@5.189.159.195 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          DATA_ROOT=/opt/signal-flow
+          APP="$DATA_ROOT/app"
+          PIDFILE=/tmp/sf-bot-run.pid
+          if [ -f "$PIDFILE" ]; then
+            OLD=$(cat "$PIDFILE" 2>/dev/null || true)
+            [ -n "${OLD:-}" ] && kill -0 "$OLD" 2>/dev/null && kill "$OLD" 2>/dev/null || true
+          fi
+          pkill -f 'sf-admin.*bot-run' 2>/dev/null || true
+          pkill -f 'signal-cli' 2>/dev/null || true
+          sleep 2
+          export PYTHONUNBUFFERED=1
+          "$APP/.venv/bin/python" -u - <<'PY'
+          import json, re, subprocess, sys
+          from datetime import datetime, timezone
+          from pathlib import Path
+          sys.path.insert(0, "/opt/signal-flow/app")
+          from sf.bot_link import signal_cli_bin, user_signal_session_dir
+          from sf.flows import save_default_flow
+          from sf.ingest import read_session_account, resolve_ingest_user
+          from sf.paths import channels_path
+          from sf.templates import CHAT_SELF_KEY, CHAT_SELF_NAME, default_flow
+
+          def scrub(s: str) -> str:
+              return re.sub(r"\+?\d{8,15}", "[redacted]", s or "")
+
+          def now() -> str:
+              return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+          # name matchers → canonical label
+          MATCHERS = [
+              ("Альманах", ("альманах", "almanac")),
+              ("Каменярі", ("каменяр",)),
+              ("Нейтрон 2.0", ("нейтрон", "neutron")),
+              ("Блендер 2.0", ("блендер", "blender", "обтвр")),
+          ]
+
+          root = Path("/opt/signal-flow")
+          signal_id, _ = resolve_ingest_user(root, "self")
+          sess = user_signal_session_dir(root, signal_id)
+          account = read_session_account(sess) or ""
+          bin_path = signal_cli_bin()
+          if not account or not bin_path:
+              raise SystemExit("missing account or signal-cli")
+
+          proc = subprocess.run(
+              [bin_path, "-a", account, "--config", str(sess), "-o", "json", "listGroups"],
+              capture_output=True, text=True, timeout=90, start_new_session=True,
+          )
+          if proc.returncode != 0:
+              raise SystemExit("listGroups failed: " + scrub((proc.stderr or "")[-200:]))
+          payload = json.loads(proc.stdout or "[]")
+          groups = payload if isinstance(payload, list) else []
+          found: dict[str, tuple[str, str]] = {}  # label -> (group_id, actual_name)
+          for g in groups:
+              if not isinstance(g, dict):
+                  continue
+              name = str(g.get("name") or g.get("title") or "")
+              gid = str(g.get("id") or g.get("groupId") or "").strip()
+              if not name or not gid:
+                  continue
+              fold = name.casefold()
+              for label, needles in MATCHERS:
+                  if label in found:
+                      continue
+                  if any(n in fold for n in needles):
+                      found[label] = (gid, name)
+          missing = [lab for lab, _ in MATCHERS if lab not in found]
+          print("found_n=", len(found), "missing=", missing, flush=True)
+          if missing:
+              raise SystemExit("missing groups: " + ",".join(missing))
+
+          rows = [{"key": CHAT_SELF_KEY, "name": CHAT_SELF_NAME, "kind": "local"}]
+          source_keys: list[str] = []
+          for label, _needles in MATCHERS:
+              gid, actual = found[label]
+              key = f"group:{gid}"
+              source_keys.append(key)
+              rows.append({"key": key, "name": actual, "kind": "group"})
+              print("wired=", scrub(actual), flush=True)
+
+          channels = {"signal": rows, "whatsapp": [], "updated_at": now()}
+          cpath = channels_path(root, signal_id)
+          cpath.parent.mkdir(parents=True, exist_ok=True)
+          cpath.write_text(json.dumps(channels, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+          flow = default_flow(
+              sources=list(source_keys),
+              filters={
+                  "keywords": [],
+                  "channels_include": list(source_keys),
+                  "channels_exclude": [],
+                  "aoi": [],
+              },
+          )
+          flow["name"] = "Перехоплення 125"
+          save_default_flow(root, signal_id, flow)
+          print("sources_n=", len(source_keys), flush=True)
+          print("flow_name=", flow["name"], flush=True)
+          print("SEED_OK", flush=True)
+          PY
+          nohup env PYTHONUNBUFFERED=1 "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli bot-run \
+            >/tmp/sf-bot-run.log 2>&1 &
+          echo $! >/tmp/sf-bot-run.pid
+          echo BOT_RUN=restarted
+          REMOTE
+          shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519
