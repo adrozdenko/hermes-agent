@@ -1,0 +1,105 @@
+name: Signal Flow link-diagnose (Contabo)
+
+# Read-only-ish: wipe incomplete self session, run signal-cli link ~25s, scrub output.
+on:
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Diagnose signal-cli link (scrubbed)
+        env:
+          SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
+          HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
+          ssh -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 root@5.189.159.195 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          DATA_ROOT=/opt/signal-flow
+          APP="$DATA_ROOT/app"
+          PIDFILE=/tmp/sf-bot-run.pid
+          if [ -f "$PIDFILE" ]; then
+            OLD=$(cat "$PIDFILE" 2>/dev/null || true)
+            [ -n "${OLD:-}" ] && kill -0 "$OLD" 2>/dev/null && kill "$OLD" 2>/dev/null || true
+          fi
+          pkill -f 'sf-admin.*bot-run' 2>/dev/null || true
+          pkill -f 'signal-cli.*link' 2>/dev/null || true
+          sleep 1
+          "$APP/.venv/bin/python" - <<'PY'
+          import os, re, shutil, signal, subprocess, sys, time
+          from pathlib import Path
+          sys.path.insert(0, "/opt/signal-flow/app")
+          from sf.bot_link import (
+              DEVICE_NAME_USER,
+              is_account_linked,
+              signal_cli_bin,
+              user_signal_session_dir,
+          )
+          from sf.register import resolve_signal_account
+          root = Path("/opt/signal-flow")
+          account = resolve_signal_account(root) or "self"
+          sess = user_signal_session_dir(root, account)
+          if sess.is_dir():
+              shutil.rmtree(sess)
+          sess.mkdir(parents=True)
+          bin_path = signal_cli_bin()
+          print("cli=", bool(bin_path), "device_name_set=", bool(DEVICE_NAME_USER))
+          print("java=", shutil.which("java"))
+          # version
+          try:
+              v = subprocess.run([bin_path, "--version"], capture_output=True, text=True, timeout=30)
+              blob = (v.stdout or "") + (v.stderr or "")
+              print("cli_version=", re.sub(r"\+?\d{8,15}", "[redacted]", blob.strip())[:120])
+          except Exception as exc:
+              print("cli_version_exc=", type(exc).__name__)
+          cmd = [bin_path, "--config", str(sess), "link", "-n", DEVICE_NAME_USER]
+          proc = subprocess.Popen(
+              cmd,
+              stdout=subprocess.PIPE,
+              stderr=subprocess.STDOUT,
+              text=True,
+              start_new_session=True,
+          )
+          lines = []
+          deadline = time.time() + 25
+          while time.time() < deadline:
+              if proc.poll() is not None:
+                  break
+              time.sleep(0.3)
+          # drain
+          try:
+              out, _ = proc.communicate(timeout=5)
+          except subprocess.TimeoutExpired:
+              proc.kill()
+              out, _ = proc.communicate(timeout=5)
+          raw = out or ""
+          for line in raw.splitlines():
+              s = line.strip()
+              if not s:
+                  continue
+              if "sgnl://" in s or "linkdevice" in s.lower():
+                  print("out: [link-uri redacted]")
+                  continue
+              s = re.sub(r"\+?\d{8,15}", "[redacted]", s)
+              print("out:", s[:200])
+          print("link_exit=", proc.returncode)
+          print("linked_after=", is_account_linked(sess))
+          # accounts.json size only
+          aj = sess / "data" / "accounts.json"
+          if aj.is_file():
+              print("accounts_json_size=", aj.stat().st_size)
+          PY
+          # restart bot-run
+          nohup env PYTHONUNBUFFERED=1 "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli bot-run \
+            >/tmp/sf-bot-run.log 2>&1 &
+          echo $! >/tmp/sf-bot-run.pid
+          sleep 1
+          echo BOT_RUN=restarted
+          REMOTE
+          shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519
