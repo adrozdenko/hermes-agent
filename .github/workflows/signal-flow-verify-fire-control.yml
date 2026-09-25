@@ -25,7 +25,7 @@ jobs:
           APP="$DATA_ROOT/app"
           echo "=== app sha hint ==="
           head -n 5 "$APP/sf/topics.py" | sed -n '1,5p' || true
-          grep -n 'has_fire_control\|вогонь-керування' "$APP/sf/topics.py" "$APP/sf/flow_match.py" | head -20
+          grep -n 'has_fire_control\|has_unknown_unit_nv\|вогонь-керування\|нв-підрозділ' "$APP/sf/topics.py" "$APP/sf/flow_match.py" | head -20
           echo "=== processes ==="
           if [ -f /tmp/sf-ingest-run.pid ] && kill -0 "$(cat /tmp/sf-ingest-run.pid)" 2>/dev/null; then
             echo INGEST_RUN=alive pid=$(cat /tmp/sf-ingest-run.pid)
@@ -50,7 +50,11 @@ jobs:
           from sf.flow_match import match_flow
           from sf.flows import load_default_flow
           from sf.ingest import resolve_ingest_user
-          from sf.topics import classify_stream_targets, has_fire_control
+          from sf.topics import (
+              classify_stream_targets,
+              has_fire_control,
+              has_unknown_unit_nv,
+          )
           from sf.units import extract_units
 
           root = Path("/opt/signal-flow")
@@ -108,6 +112,19 @@ jobs:
           assert any("вогонь-керування" in r for r in reasons), reasons
           assert targets == frozenset({"arta"}), targets
           assert not ok_s and not ok_f
+
+          # NV header alone → admit default (empty specialty)
+          nv_text = "укх р/м НВ невідома частина — обстановка без подій (scrubbed)"
+          assert has_unknown_unit_nv(nv_text), "nv detector missing"
+          nv_msg = {"source_key": sk, "text": nv_text, "id": "stub-nv", "timestamp": 2}
+          ok_nv, reasons_nv = match_flow(stub_flow, nv_msg)
+          nv_targets = classify_stream_targets(nv_text, units=extract_units(nv_text))
+          print("nv_match_ok=", ok_nv, flush=True)
+          print("nv_reasons=", reasons_nv, flush=True)
+          print("nv_targets=", sorted(nv_targets), flush=True)
+          assert ok_nv, reasons_nv
+          assert any("нв-підрозділ" in r for r in reasons_nv), reasons_nv
+          assert nv_targets == frozenset(), nv_targets
           print("VERIFY_OK", flush=True)
           PY
           REMOTE
