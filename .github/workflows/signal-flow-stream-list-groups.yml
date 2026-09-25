@@ -18,71 +18,7 @@ jobs:
           printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
-          ssh -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 root@5.189.159.195 'bash -s' <<'REMOTE'
-          set -euo pipefail
-          DATA_ROOT=/opt/signal-flow
-          APP="$DATA_ROOT/app"
-          INGPID=/tmp/sf-ingest-run.pid
-          if [ -f "$INGPID" ]; then
-            OLD=$(cat "$INGPID" 2>/dev/null || true)
-            [ -n "${OLD:-}" ] && kill -0 "$OLD" 2>/dev/null && kill "$OLD" 2>/dev/null || true
-          fi
-          pkill -f 'sf-admin.*ingest-run' 2>/dev/null || true
-          pkill -f 'signal-cli' 2>/dev/null || true
-          sleep 2
-          ACC=$(python3 -c "import json;print(json.load(open('/opt/signal-flow/config/bot.json')).get('signal_account') or '')")
-          for c in /opt/signal-flow/bin/signal-cli /usr/local/bin/signal-cli /usr/bin/signal-cli; do
-            if [ -x "$c" ]; then SC=$c; break; fi
-          done
-          SC=${SC:-$(command -v signal-cli || true)}
-          echo "ACC_SET=$([ -n "$ACC" ] && echo yes || echo no)"
-          echo "SIGNAL_CLI=${SC:-missing}"
-          echo "BOT_DATA=$([ -d $DATA_ROOT/bot-signal/data ] && echo present || echo empty)"
-          if [ -n "${ACC:-}" ] && [ -n "${SC:-}" ]; then
-            echo "=== bot-signal receive sync (30s) ==="
-            set +e
-            timeout 70 "$SC" -a "$ACC" --config "$DATA_ROOT/bot-signal" receive -t 30 >/tmp/sf-recv.log 2>&1
-            echo "RECV_RC=$?"
-            set -e
-            sed -E 's/\+?[0-9]{8,15}/[redacted]/g; /sgnl:\/\//d' /tmp/sf-recv.log | grep -Ei 'group|insomni|error|Exception|Synced|Failed' | head -40 || true
-            echo "RECV_LINES=$(wc -l < /tmp/sf-recv.log)"
-            pkill -f 'signal-cli' 2>/dev/null || true
-            sleep 1
-            echo "=== raw listGroups ==="
-            set +e
-            timeout 90 "$SC" -a "$ACC" --config "$DATA_ROOT/bot-signal" -o json listGroups >/tmp/sf-lg.json 2>/tmp/sf-lg.err
-            echo "LIST_RC=$?"
-            set -e
-            python3 -c '
-import json,re
-from pathlib import Path
-raw=Path("/tmp/sf-lg.json").read_text().strip()
-err=Path("/tmp/sf-lg.err").read_text().strip()
-scrub=lambda s: re.sub(r"\+?\d{8,15}","[redacted]",s)
-print("ERR", scrub(err)[:300] if err else "")
-print("RAW_LEN", len(raw))
-if raw:
-  try:
-    data=json.loads(raw)
-  except Exception as e:
-    print("PARSE", e); data=[]
-  if isinstance(data, dict):
-    data=data.get("groups") or data.get("result") or []
-  print("COUNT", len(data) if isinstance(data,list) else type(data))
-  if isinstance(data,list):
-    for g in data[:40]:
-      if isinstance(g,dict):
-        n=g.get("name") or g.get("title") or ""
-        i=str(g.get("id") or g.get("groupId") or "")
-        print("GROUP", repr(n), i[:20]+("…" if len(i)>20 else ""))
-'
-          fi
-          echo "=== sf-admin list-bot-groups ==="
-          "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli list-bot-groups || true
-          nohup env PYTHONUNBUFFERED=1 "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli \
-            ingest-run self --receive-timeout 8 --idle-sleep 1 \
-            >/tmp/sf-ingest-run.log 2>&1 &
-          echo $! >/tmp/sf-ingest-run.pid
-          echo INGEST_RUN=restarted
-          REMOTE
+          SCRIPT_B64='c2V0IC1ldW8gcGlwZWZhaWwKREFUQV9ST09UPS9vcHQvc2lnbmFsLWZsb3cKQVBQPSIkREFUQV9ST09UL2FwcCIKSU5HUElEPS90bXAvc2YtaW5nZXN0LXJ1bi5waWQKaWYgWyAtZiAiJElOR1BJRCIgXTsgdGhlbiBPTEQ9JChjYXQgIiRJTkdQSUQiIDI+L2Rldi9udWxsIHx8IHRydWUpOyBbIC1uICIke09MRDotfSIgXSAmJiBraWxsIC0wICIkT0xEIiAyPi9kZXYvbnVsbCAmJiBraWxsICIkT0xEIiAyPi9kZXYvbnVsbCB8fCB0cnVlOyBmaQpwa2lsbCAtZiAnc2YtYWRtaW4uKmluZ2VzdC1ydW4nIDI+L2Rldi9udWxsIHx8IHRydWUKcGtpbGwgLWYgJ3NpZ25hbC1jbGknIDI+L2Rldi9udWxsIHx8IHRydWUKc2xlZXAgMgpBQ0M9JChweXRob24zIC1jICJpbXBvcnQganNvbjtwcmludChqc29uLmxvYWQob3BlbignL29wdC9zaWduYWwtZmxvdy9jb25maWcvYm90Lmpzb24nKSkuZ2V0KCdzaWduYWxfYWNjb3VudCcpIG9yICcnKSIpClNDPSIiCmZvciBjIGluIC9vcHQvc2lnbmFsLWZsb3cvYmluL3NpZ25hbC1jbGkgL3Vzci9sb2NhbC9iaW4vc2lnbmFsLWNsaSAvdXNyL2Jpbi9zaWduYWwtY2xpOyBkbwogIFsgLXggIiRjIiBdICYmIFNDPSRjICYmIGJyZWFrCmRvbmUKU0M9JHtTQzotJChjb21tYW5kIC12IHNpZ25hbC1jbGkgfHwgdHJ1ZSl9CmVjaG8gIkFDQ19TRVQ9JChbIC1uICIkQUNDIiBdICYmIGVjaG8geWVzIHx8IGVjaG8gbm8pIgplY2hvICJTSUdOQUxfQ0xJPSR7U0M6LW1pc3Npbmd9IgplY2hvICJCT1RfREFUQT0kKFsgLWQgJERBVEFfUk9PVC9ib3Qtc2lnbmFsL2RhdGEgXSAmJiBlY2hvIHByZXNlbnQgfHwgZWNobyBlbXB0eSkiCmlmIFsgLW4gIiR7QUNDOi19IiBdICYmIFsgLW4gIiR7U0M6LX0iIF07IHRoZW4KICBlY2hvICI9PT0gcmVjZWl2ZSAzMHMgPT09IgogIHNldCArZQogIHRpbWVvdXQgNzAgIiRTQyIgLWEgIiRBQ0MiIC0tY29uZmlnICIkREFUQV9ST09UL2JvdC1zaWduYWwiIHJlY2VpdmUgLXQgMzAgPi90bXAvc2YtcmVjdi5sb2cgMj4mMQogIGVjaG8gIlJFQ1ZfUkM9JD8iCiAgc2V0IC1lCiAgc2VkIC1FICdzL1wrP1swLTldezgsMTV9L1tyZWRhY3RlZF0vZzsgL3Nnbmw6XC9cLy9kJyAvdG1wL3NmLXJlY3YubG9nIHwgZ3JlcCAtRWkgJ2dyb3VwfGluc29tbml8ZXJyb3J8RXhjZXB0aW9ufFN5bmNlZHxGYWlsZWQnIHwgaGVhZCAtNDAgfHwgdHJ1ZQogIGVjaG8gIlJFQ1ZfTElORVM9JCh3YyAtbCA8IC90bXAvc2YtcmVjdi5sb2cpIgogIHBraWxsIC1mICdzaWduYWwtY2xpJyAyPi9kZXYvbnVsbCB8fCB0cnVlCiAgc2xlZXAgMQogIGVjaG8gIj09PSBsaXN0R3JvdXBzID09PSIKICBzZXQgK2UKICB0aW1lb3V0IDkwICIkU0MiIC1hICIkQUNDIiAtLWNvbmZpZyAiJERBVEFfUk9PVC9ib3Qtc2lnbmFsIiAtbyBqc29uIGxpc3RHcm91cHMgPi90bXAvc2YtbGcuanNvbiAyPi90bXAvc2YtbGcuZXJyCiAgZWNobyAiTElTVF9SQz0kPyIKICBzZXQgLWUKICBweXRob24zIC1jICJpbXBvcnQganNvbixyZTtmcm9tIHBhdGhsaWIgaW1wb3J0IFBhdGg7cmF3PVBhdGgoJy90bXAvc2YtbGcuanNvbicpLnJlYWRfdGV4dCgpLnN0cmlwKCk7ZXJyPVBhdGgoJy90bXAvc2YtbGcuZXJyJykucmVhZF90ZXh0KCkuc3RyaXAoKTtzY3J1Yj1sYW1iZGEgczpyZS5zdWIocidcXCs/XFxkezgsMTV9JywnW3JlZGFjdGVkXScscyk7cHJpbnQoJ0VSUicsc2NydWIoZXJyKVs6MzAwXSBpZiBlcnIgZWxzZSAnJyk7cHJpbnQoJ1JBV19MRU4nLGxlbihyYXcpKTsKZGF0YT1bXTsKaW1wb3J0IHN5cwppZiByYXc6CiAgdHJ5OiBkYXRhPWpzb24ubG9hZHMocmF3KQogIGV4Y2VwdCBFeGNlcHRpb24gYXMgZTogcHJpbnQoJ1BBUlNFJyxlKTsgZGF0YT1bXQppZiBpc2luc3RhbmNlKGRhdGEsZGljdCk6IGRhdGE9ZGF0YS5nZXQoJ2dyb3VwcycpIG9yIGRhdGEuZ2V0KCdyZXN1bHQnKSBvciBbXQpwcmludCgnQ09VTlQnLCBsZW4oZGF0YSkgaWYgaXNpbnN0YW5jZShkYXRhLGxpc3QpIGVsc2UgdHlwZShkYXRhKSkKaWYgaXNpbnN0YW5jZShkYXRhLGxpc3QpOgogIGZvciBnIGluIGRhdGFbOjQwXToKICAgIGlmIGlzaW5zdGFuY2UoZyxkaWN0KToKICAgICAgbj1nLmdldCgnbmFtZScpIG9yIGcuZ2V0KCd0aXRsZScpIG9yICcnOyBpPXN0cihnLmdldCgnaWQnKSBvciBnLmdldCgnZ3JvdXBJZCcpIG9yICcnKTsKICAgICAgcHJpbnQoJ0dST1VQJyxyZXByKG4pLCAoaVs6MjBdKyfigKYnKSBpZiBsZW4oaSk+MjAgZWxzZSBpKSIKZmkKZWNobyAiPT09IHNmLWFkbWluIGxpc3QtYm90LWdyb3VwcyA9PT0iCiIkQVBQLy52ZW52L2Jpbi9zZi1hZG1pbiIgLS1kYXRhLXJvb3QgIiREQVRBX1JPT1QiIC0tZm9yY2UtYWRtaW4tY2xpIGxpc3QtYm90LWdyb3VwcyB8fCB0cnVlCiMgY2xlYXIgZmFrZSBzdHJlYW0gaWYgZ3JvdXBfaWQgbG9va3MgbGlrZSBhIG5hbWUKcHl0aG9uMyAtYyAiaW1wb3J0IGpzb247ZnJvbSBwYXRobGliIGltcG9ydCBQYXRoO3A9UGF0aCgnL29wdC9zaWduYWwtZmxvdy9ib3Qtc2lnbmFsL3N0cmVhbS5qc29uJyk7CnByaW50KCdTVFJFQU0nLCBwLnJlYWRfdGV4dCgpWzoyMDBdIGlmIHAuZXhpc3RzKCkgZWxzZSAnbWlzc2luZycpIgpub2h1cCBlbnYgUFlUSE9OVU5CVUZGRVJFRD0xICIkQVBQLy52ZW52L2Jpbi9zZi1hZG1pbiIgLS1kYXRhLXJvb3QgIiREQVRBX1JPT1QiIC0tZm9yY2UtYWRtaW4tY2xpIGluZ2VzdC1ydW4gc2VsZiAtLXJlY2VpdmUtdGltZW91dCA4IC0taWRsZS1zbGVlcCAxID4vdG1wL3NmLWluZ2VzdC1ydW4ubG9nIDI+JjEgJgplY2hvICQhID4vdG1wL3NmLWluZ2VzdC1ydW4ucGlkCmVjaG8gSU5HRVNUX1JVTj1yZXN0YXJ0ZWQK'
+          echo "$SCRIPT_B64" | base64 -d > /tmp/sf-remote.sh
+          ssh -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 root@5.189.159.195 'bash -s' < /tmp/sf-remote.sh
           shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519
