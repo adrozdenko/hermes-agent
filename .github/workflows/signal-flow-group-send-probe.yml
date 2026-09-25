@@ -1,0 +1,87 @@
+name: Signal Flow group-send-probe (Contabo)
+
+# Ops: one scrubbed send -g to enabled stream sink. Does NOT pkill signal-cli / ingest.
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "stream target key (default|arta|air)"
+        required: false
+        default: "default"
+        type: choice
+        options:
+          - default
+          - arta
+          - air
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Probe group send on Contabo
+        env:
+          SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
+          HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
+          TARGET: ${{ inputs.target || 'default' }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
+          ssh -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 root@5.189.159.195 \
+            "TARGET=$(printf %q "$TARGET") bash -s" <<'REMOTE'
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re, sys
+          from pathlib import Path
+          sys.path.insert(0, "/opt/signal-flow/app")
+          from sf.delivery import send_to_group
+          from sf.bot_link import BotLinkError
+          root = Path("/opt/signal-flow")
+          target = os.environ.get("TARGET", "default").strip() or "default"
+          # stream.json shape: {users:{self:{flows:{...:{stream:{sinks:{...}}}}}}} vary — find enabled sinks
+          candidates = list(root.glob("users/*/flows/*/stream.json"))
+          if not candidates:
+              candidates = list(root.glob("**/stream.json"))
+          print("stream_files", len(candidates))
+          sinks = {}
+          for sp in candidates:
+              try:
+                  data = json.loads(sp.read_text())
+              except Exception:
+                  continue
+              # tolerate nested shapes
+              blob = data
+              for k in ("stream", "sinks"):
+                  if isinstance(blob, dict) and k in blob:
+                      blob = blob[k]
+              if isinstance(blob, dict) and "sinks" in blob:
+                  blob = blob["sinks"]
+              if not isinstance(blob, dict):
+                  continue
+              for key, val in blob.items():
+                  if isinstance(val, dict) and val.get("enabled") and val.get("group_id"):
+                      sinks[key] = val
+          print("enabled_sinks", sorted(sinks.keys()))
+          if target not in sinks:
+              print("missing_target", target)
+              raise SystemExit(2)
+          dest = sinks[target]
+          gid = dest["group_id"]
+          gname = dest.get("group_name") or "?"
+          print("target", target, "group_name", gname, "gid_len", len(gid))
+          body = f"Signal Flow smoke {target}"
+          try:
+              res = send_to_group(root, gid, body)
+              print("ok", res.ok, "detail", re.sub(r"\+?\d{8,15}", "[redacted]", str(res.detail))[:240])
+          except BotLinkError as exc:
+              print("exc", re.sub(r"\+?\d{8,15}", "[redacted]", str(exc))[:240])
+              raise SystemExit(3)
+          except Exception as exc:
+              print("exc", type(exc).__name__, re.sub(r"\+?\d{8,15}", "[redacted]", str(exc))[:240])
+              raise SystemExit(4)
+          PY
+          REMOTE
+          shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519
