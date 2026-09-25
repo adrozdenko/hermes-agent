@@ -1,0 +1,48 @@
+name: Signal Flow flow-log diag4 (Contabo)
+on:
+  workflow_dispatch:
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: extract group_error details from ingest log
+        env:
+          SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
+          HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
+          ssh -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 root@5.189.159.195 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          from collections import Counter
+          p=Path("/tmp/sf-ingest-run.log")
+          text=p.read_text(errors="replace") if p.is_file() else ""
+          print("log_bytes", len(text), "lines", text.count("\n"))
+          # any group_error substrings
+          errs=Counter()
+          for ln in text.splitlines():
+              ln2=re.sub(r"\+?\d{8,15}","[redacted]",ln)
+              if "group_error" in ln2 or "send group" in ln2.lower() or "Failed to send" in ln2 or "Unauthorized" in ln2 or "LockedException" in ln2 or "Config file is in use" in ln2:
+                  # compress
+                  s=ln2
+                  if len(s)>300: s=s[:300]+"…"
+                  errs[s]+=1
+          print("interesting_n", len(errs))
+          for s,c in errs.most_common(25):
+              print(f"n={c} :: {s}")
+          # also: around 17:21 cycles — print 80 lines containing 17:2 or group_
+          # timestamps may not be in log. Print last 200 lines filtered
+          print("=== last detail-ish ===")
+          for ln in text.splitlines()[-200:]:
+              if any(k in ln for k in ("group_error","group_sent:","fp_suppress","Config file","Locked","Failed","Exception","error:")):
+                  print(re.sub(r"\+?\d{8,15}","[redacted]",ln)[:300])
+          PY
+          REMOTE
+          shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519
