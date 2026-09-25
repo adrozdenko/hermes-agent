@@ -78,14 +78,20 @@ jobs:
 
           text = "обстановка без номерних частин зі списку — scrubbed blender stub"
           assert not extract_units(text), "stub must not contain strip units"
+          # Live receive leaves opaque Група … — verify must exercise enrich, not a pre-labeled chat.
+          from sf.ingest import apply_channel_labels, channel_display_names
+          names = channel_display_names(root, signal_id)
           msg = {
               "source_key": blender_key,
-              "chat": blender_name or "Блендер 2.0",
+              "chat": "Група xxxxxxxxxx…",
               "text": text,
               "id": "probe-blender-1",
               "timestamp": 1,
           }
-          assert is_blender_source(msg), "is_blender_source failed on chat name"
+          assert not is_blender_source(msg), "opaque chat must not look blender pre-enrich"
+          msg = apply_channel_labels(msg, names)
+          assert is_blender_source(msg), "enrich/_blender_admit must unlock blender"
+          print("post_enrich_admit", bool(msg.get("_blender_admit")), flush=True)
           # Ensure channels_include allows blender_key
           filters = dict(flow.get("filters") or {})
           ch_inc = list(filters.get("channels_include") or [])
