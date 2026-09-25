@@ -43,6 +43,17 @@ jobs:
           DATA_ROOT=/opt/signal-flow
           APP="$DATA_ROOT/app"
           test -d "$DATA_ROOT/config" || { echo "layout missing; run install-signal-flow-layout first" >&2; exit 1; }
+          # Release .venv file locks before replace (ingest / signal-cli hold them open)
+          for f in /tmp/sf-ingest-run.pid /tmp/sf-bot-run.pid; do
+            if [ -f "$f" ]; then
+              OLD=$(cat "$f" 2>/dev/null || true)
+              [ -n "${OLD:-}" ] && kill -0 "$OLD" 2>/dev/null && kill "$OLD" 2>/dev/null || true
+            fi
+          done
+          pkill -f 'sf-admin.*ingest-run' 2>/dev/null || true
+          pkill -f 'sf-admin.*bot-run' 2>/dev/null || true
+          pkill -f 'signal-cli' 2>/dev/null || true
+          sleep 2
           tar -C "$DATA_ROOT" -xzf /tmp/signal-flow.tgz
           rm -rf "$APP"
           mv "$DATA_ROOT/signal-flow" "$APP"
