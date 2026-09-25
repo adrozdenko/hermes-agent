@@ -29,7 +29,7 @@ jobs:
           from sf.flows import load_default_flow, save_default_flow
           from sf.ingest import resolve_ingest_user
 
-          KEYWORDS = [
+          UNITS = [
               "254 мсп",
               "488 мсп",
               "283 мсп",
@@ -39,7 +39,6 @@ jobs:
               "71 опБпС",
               "3 бБпС",
               "4 опБпС",
-              "Шторм",
           ]
 
           root = Path("/opt/signal-flow")
@@ -47,16 +46,20 @@ jobs:
           flow = load_default_flow(root, signal_id)
           if not isinstance(flow.get("filters"), dict):
               flow["filters"] = {}
-          flow["filters"]["keywords"] = list(KEYWORDS)
-          flow["filters"]["keywords_exclude"] = ["31 мсп", "67 мсд"]
+          flow["filters"]["units"] = list(UNITS)
+          flow["filters"]["units_exclude"] = ["31 мсп", "67 мсд"]
+          # Clear legacy substring keywords so OpsPower unit gate owns matching
+          flow["filters"]["keywords"] = ["Шторм"]  # bare name; units detector covers numbered
+          flow["filters"]["keywords_exclude"] = []
           # keep channels_include / sources as already seeded
           if not flow.get("name"):
               flow["name"] = "Перехоплення 125"
           save_default_flow(root, signal_id, flow)
           f = flow.get("filters") or {}
           print("flow_name=", flow.get("name"), flush=True)
-          print("keywords_n=", len(f.get("keywords") or []), flush=True)
-          print("keywords_exclude=", "|".join(f.get("keywords_exclude") or []), flush=True)
+          print("units_n=", len(f.get("units") or []), flush=True)
+          print("units=", "|".join(f.get("units") or []), flush=True)
+          print("units_exclude=", "|".join(f.get("units_exclude") or []), flush=True)
           print("keywords=", "|".join(f.get("keywords") or []), flush=True)
           print("channels_include_n=", len(f.get("channels_include") or []), flush=True)
           print("sources_n=", len(flow.get("sources") or []), flush=True)
