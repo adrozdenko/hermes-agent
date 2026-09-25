@@ -115,11 +115,12 @@ jobs:
               sed -E 's/\+?[0-9]{8,15}/[redacted]/g; s/[0-9]{6,}@(s\.whatsapp\.net|g\.us|lid|newsletter)/[redacted]/gi; /sgnl:\/\//d' "$LOG" | tail -n 40 || true
               exit 1
             fi
-            if grep -q 'event=sidecar_ready\|event=sidecar_authenticated' "$LOG" 2>/dev/null                || grep -qE '"type":"(ready|authenticated)"' "$LOG" 2>/dev/null; then
+            if grep -qE 'event=sidecar_(ready|authenticated)' "$LOG" 2>/dev/null \
+               || grep -qE '"type":"(ready|authenticated)"' "$LOG" 2>/dev/null; then
               READY=1
               break
             fi
-            if grep -q 'event=sidecar_qr\|потребує QR\|немає node_modules\|Chromium/Chrome не знайдено' "$LOG" 2>/dev/null; then
+            if grep -qE 'event=sidecar_qr|потребує QR|немає node_modules|Chromium/Chrome не знайдено' "$LOG" 2>/dev/null; then
               echo "WA_INGEST=not_bonded_or_misconfigured"
               sed -E 's/\+?[0-9]{8,15}/[redacted]/g; s/[0-9]{6,}@(s\.whatsapp\.net|g\.us|lid|newsletter)/[redacted]/gi; /sgnl:\/\//d' "$LOG" | tail -n 40 || true
               exit 1
