@@ -51,6 +51,12 @@ jobs:
                   nfiles = sum(1 for _ in sess.rglob("*") if _.is_file())
               name = re.sub(r"\+?\d{8,15}", "[redacted]", u.name)
               print(f"user={name} sess_exists={sess.is_dir()} linked={linked} png={png} files={nfiles}")
+              if sess.is_dir():
+                  for f in sorted(sess.rglob("*")):
+                      if f.is_file():
+                          rel = str(f.relative_to(sess))
+                          rel = re.sub(r"\+?\d{8,15}", "[redacted]", rel)
+                          print(f"  file={rel} size={f.stat().st_size}")
           print("bot_linked=", is_account_linked(root / "bot-signal"))
           PY
           # any leftover link PIDs?
