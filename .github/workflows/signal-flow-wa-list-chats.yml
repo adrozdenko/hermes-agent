@@ -1,0 +1,199 @@
+name: Signal Flow wa-list-chats (Contabo)
+
+# List WhatsApp chat titles + opaque keys only. Never prints phones/full JIDs/bodies.
+# If sidecar not installed: WA_INSTALL_NEEDED. If not linked: needs wa-link first.
+# Does not stop Signal ingest-run. Highlights «Вуха 66» candidates by title.
+
+on:
+  workflow_dispatch:
+    inputs:
+      user_id:
+        description: "Farm user id under users/ (safe path). Default self."
+        type: string
+        default: "self"
+      refresh_seconds:
+        description: "Seconds to wait for chats event"
+        type: string
+        default: "45"
+
+jobs:
+  list:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: List WA chats (opaque keys)
+        env:
+          SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
+          HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
+          USER_ID: ${{ inputs.user_id }}
+          REFRESH_SECONDS: ${{ inputs.refresh_seconds }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
+          ssh -o ConnectTimeout=30 -o ServerAliveInterval=15 \
+              -i ~/.ssh/id_ed25519 root@5.189.159.195 \
+              "USER_ID=$(printf '%q' "${USER_ID:-self}") REFRESH_SECONDS=$(printf '%q' "${REFRESH_SECONDS:-45}") bash -s" <<'REMOTE'
+          set -euo pipefail
+          DATA_ROOT=/opt/signal-flow
+          APP="$DATA_ROOT/app"
+          SIDE="$APP/whatsapp_sidecar"
+          USER_RAW="${USER_ID:-self}"
+          USER_SAFE=$(printf '%s' "$USER_RAW" | tr -cd 'A-Za-z0-9._+-' | sed 's/^[._]*//;s/[._]*$//')
+          if [ "$USER_SAFE" = "self" ]; then
+            if [ -d "$DATA_ROOT/users/self" ]; then UDIR="$DATA_ROOT/users/self"
+            else UDIR=$(find "$DATA_ROOT/users" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -n1 || true); fi
+          else
+            UDIR="$DATA_ROOT/users/$USER_SAFE"
+          fi
+          if [ -z "${UDIR:-}" ] || [ ! -d "$UDIR" ]; then
+            echo "WA_USER_MISSING=1" >&2
+            exit 1
+          fi
+          if [ ! -f "$SIDE/connector.js" ] || [ ! -d "$SIDE/node_modules/whatsapp-web.js" ]; then
+            echo "WA_INSTALL_NEEDED=1"
+            exit 2
+          fi
+          SESSION="$UDIR/sessions/whatsapp"
+          ATT="$UDIR/data/whatsapp-attachments"
+          CACHE="$SESSION/web-cache"
+          mkdir -p "$SESSION" "$ATT" "$CACHE"
+
+          CHROME=""
+          for c in google-chrome-stable chromium-browser chromium google-chrome; do
+            if command -v "$c" >/dev/null 2>&1; then CHROME=$(command -v "$c"); break; fi
+          done
+          if [ -z "$CHROME" ]; then
+            echo "WA_INSTALL_NEEDED=1"
+            exit 2
+          fi
+
+          export SF_WA_DATA_DIR="$SESSION"
+          export SF_WA_SESSION_DIR="$SESSION"
+          export SF_WA_ATTACHMENTS_DIR="$ATT"
+          export SF_WA_CACHE_DIR="$CACHE"
+          export SF_WA_CHROME_PATH="$CHROME"
+          export SF_WA_HEADLESS=true
+
+          WAIT="${REFRESH_SECONDS:-45}"
+          case "$WAIT" in
+            ''|*[!0-9]*) WAIT=45 ;;
+          esac
+          if [ "$WAIT" -gt 120 ]; then WAIT=120; fi
+
+          # argv before heredoc so sys.argv is correct
+          python3 - "$SIDE/connector.js" "$WAIT" <<'PY'
+          import hashlib, json, os, re, subprocess, sys, time
+
+          connector, wait_s = sys.argv[1], int(sys.argv[2])
+
+          def opaque(raw: str) -> str:
+              s = (raw or "").strip()
+              if not s:
+                  return ""
+              if s.startswith("whatsapp:"):
+                  return s
+              return "whatsapp:h_" + hashlib.sha256(s.encode("utf-8")).hexdigest()[:20]
+
+          JID_RE = re.compile(
+              r"[0-9]{6,}@(?:s\.whatsapp\.net|g\.us|lid|newsletter)|(?:\+\d{10,15})",
+              re.I,
+          )
+
+          def scrub(s: str) -> str:
+              return JID_RE.sub("[redacted]", str(s or ""))
+
+          env = os.environ.copy()
+          proc = subprocess.Popen(
+              ["node", connector],
+              stdin=subprocess.PIPE,
+              stdout=subprocess.PIPE,
+              stderr=subprocess.STDOUT,
+              text=True,
+              bufsize=1,
+              env=env,
+          )
+          chats = None
+          state = "starting"
+          deadline = time.time() + wait_s
+          try:
+              assert proc.stdout is not None
+              while time.time() < deadline:
+                  line = proc.stdout.readline()
+                  if not line and proc.poll() is not None:
+                      break
+                  if not line:
+                      time.sleep(0.05)
+                      continue
+                  line = line.strip()
+                  if not line:
+                      continue
+                  try:
+                      ev = json.loads(line)
+                  except json.JSONDecodeError:
+                      continue
+                  t = str(ev.get("type") or "")
+                  if t == "qr":
+                      state = "needs-qr"
+                      print("state=needs-qr (scan QR via wa-link first)", flush=True)
+                      break
+                  if t in ("ready", "authenticated"):
+                      state = t
+                      try:
+                          assert proc.stdin is not None
+                          proc.stdin.write(json.dumps({"action": "refresh_chats"}) + "\n")
+                          proc.stdin.flush()
+                      except Exception:
+                          pass
+                  if t == "chats" and isinstance(ev.get("chats"), list):
+                      chats = ev["chats"]
+                      state = "chats"
+                      break
+                  if t in ("auth_failure", "disconnected", "error", "incompatible"):
+                      state = t
+                      print(f"state={t}", flush=True)
+                      break
+          finally:
+              try:
+                  if proc.stdin:
+                      proc.stdin.write(json.dumps({"action": "shutdown"}) + "\n")
+                      proc.stdin.flush()
+              except Exception:
+                  pass
+              try:
+                  proc.wait(timeout=8)
+              except Exception:
+                  proc.kill()
+
+          print(f"list_state={state}", flush=True)
+          if not chats:
+              print("chats_n=0", flush=True)
+              print("HINT=run_wa-link_then_retry_or_wait_for_ready", flush=True)
+              raise SystemExit(0)
+
+          print(f"chats_n={len(chats)}", flush=True)
+          vuha = []
+          for row in chats:
+              if not isinstance(row, dict):
+                  continue
+              raw_id = str(row.get("id") or "")
+              name = scrub(str(row.get("name") or ""))[:180]
+              kind = str(row.get("kind") or "")[:40]
+              key = opaque(raw_id)
+              unread = int(row.get("unread_count") or 0)
+              print(
+                  f"chat name={name!r} kind={kind!r} key={key!r} unread={unread}",
+                  flush=True,
+              )
+              fold = name.casefold()
+              if "вуха" in fold or "vuha" in fold or re.search(r"\b66\b", name):
+                  vuha.append((name, key, kind))
+          print(f"VUHA_CANDIDATES_n={len(vuha)}", flush=True)
+          for name, key, kind in vuha[:10]:
+              print(f"VUHA_HIT name={name!r} kind={kind!r} key={key!r}", flush=True)
+          print("LIST_DONE", flush=True)
+          PY
+          REMOTE
+          shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519

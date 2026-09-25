@@ -1,0 +1,186 @@
+name: Signal Flow wa-link (Contabo WhatsApp QR)
+
+# Path B stub: start WhatsApp Web sidecar LocalAuth QR for farm user.
+# Manual workflow_dispatch only. Never rebuilds Hermes.
+# Never echoes phones / JIDs / message bodies / full QR data-URLs.
+# QR PNG uploaded as artifact (admin ops). Prefer phone Linked-devices scan.
+# Requires Contabo Node + Chromium + npm install under app/whatsapp_sidecar;
+# if missing → WA_INSTALL_NEEDED=1 (no partial deploy). Does NOT touch ingest-run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      user_id:
+        description: "Farm user id under users/ (safe path; not a phone). Default self."
+        type: string
+        default: "self"
+      clear_session:
+        description: "Wipe sessions/whatsapp before link (forces new QR)"
+        type: boolean
+        default: false
+
+jobs:
+  wa-link:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Start WA sidecar QR on Contabo
+        env:
+          SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
+          HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
+          USER_ID: ${{ inputs.user_id }}
+          CLEAR_SESSION: ${{ inputs.clear_session }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SSH_KEY:-}" ] || [ -z "${HOST_KEY:-}" ]; then
+            echo "Missing HERMES_SSH_KEY or HERMES_HOST_KEY" >&2
+            exit 1
+          fi
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
+
+          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=40 \
+              -o TCPKeepAlive=yes -o ConnectTimeout=30 \
+              -i ~/.ssh/id_ed25519 root@5.189.159.195 \
+              "USER_ID=$(printf '%q' "${USER_ID:-self}") CLEAR_SESSION=$(printf '%q' "${CLEAR_SESSION:-false}") bash -s" <<'REMOTE'
+          set -euo pipefail
+          DATA_ROOT=/opt/signal-flow
+          APP="$DATA_ROOT/app"
+          SIDE="$APP/whatsapp_sidecar"
+          USER_RAW="${USER_ID:-self}"
+          USER_SAFE=$(printf '%s' "$USER_RAW" | tr -cd 'A-Za-z0-9._+-' | sed 's/^[._]*//;s/[._]*$//')
+          if [ -z "$USER_SAFE" ] || [ "$USER_SAFE" = "." ] || [ "$USER_SAFE" = ".." ]; then
+            echo "bad_user_id" >&2
+            exit 1
+          fi
+          if [ "$USER_SAFE" = "self" ]; then
+            if [ -d "$DATA_ROOT/users/self" ]; then
+              UDIR="$DATA_ROOT/users/self"
+            else
+              UDIR=$(find "$DATA_ROOT/users" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -n1 || true)
+            fi
+          else
+            UDIR="$DATA_ROOT/users/$USER_SAFE"
+          fi
+          echo "user_dir_ok=$([ -n "${UDIR:-}" ] && [ -d "${UDIR:-}" ] && echo 1 || echo 0)"
+          if [ -z "${UDIR:-}" ] || [ ! -d "$UDIR" ]; then
+            echo "WA_USER_MISSING=1"
+            exit 1
+          fi
+          # Stable pointer for artifact scp (no user id in Actions logs beyond safe path)
+          echo "$UDIR" > /tmp/sf-wa-udir.txt
+          SESSION="$UDIR/sessions/whatsapp"
+          ATT="$UDIR/data/whatsapp-attachments"
+          CACHE="$SESSION/web-cache"
+          QR_OUT="$SESSION/qr.png"
+          LOG=/tmp/sf-wa-link.log
+          PIDFILE=/tmp/sf-wa-sidecar.pid
+
+          if [ ! -f "$SIDE/connector.js" ]; then
+            echo "WA_INSTALL_NEEDED=1"
+            echo "missing connector.js — deploy signal-flow app with whatsapp_sidecar first" >&2
+            exit 2
+          fi
+          if [ ! -d "$SIDE/node_modules/whatsapp-web.js" ]; then
+            echo "WA_INSTALL_NEEDED=1"
+            echo "missing node_modules — npm install on Contabo first" >&2
+            exit 2
+          fi
+          if ! command -v node >/dev/null 2>&1; then
+            echo "WA_INSTALL_NEEDED=1"
+            echo "node missing" >&2
+            exit 2
+          fi
+          CHROME=""
+          for c in google-chrome-stable chromium-browser chromium google-chrome; do
+            if command -v "$c" >/dev/null 2>&1; then CHROME=$(command -v "$c"); break; fi
+          done
+          if [ -z "$CHROME" ]; then
+            echo "WA_INSTALL_NEEDED=1"
+            echo "chromium/chrome missing" >&2
+            exit 2
+          fi
+          echo "chrome_ok=1 node_ok=1 sidecar_ok=1"
+
+          mkdir -p "$SESSION" "$ATT" "$CACHE"
+          chmod 700 "$SESSION" "$ATT" 2>/dev/null || true
+
+          # Stop leftover WA sidecar only (never Signal ingest-run / bot-run)
+          if [ -f "$PIDFILE" ]; then
+            OLD=$(cat "$PIDFILE" 2>/dev/null || true)
+            [ -n "${OLD:-}" ] && kill "$OLD" 2>/dev/null || true
+          fi
+          pkill -f 'whatsapp_sidecar/connector.js' 2>/dev/null || true
+          sleep 1
+
+          if [ "${CLEAR_SESSION:-false}" = "true" ]; then
+            echo "clear_session=true"
+            find "$SESSION" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+            mkdir -p "$SESSION" "$CACHE"
+          fi
+          rm -f "$QR_OUT" "$LOG" /tmp/sf-wa-qr.png
+
+          export SF_WA_DATA_DIR="$SESSION"
+          export SF_WA_SESSION_DIR="$SESSION"
+          export SF_WA_ATTACHMENTS_DIR="$ATT"
+          export SF_WA_CACHE_DIR="$CACHE"
+          export SF_WA_CHROME_PATH="$CHROME"
+          export SF_WA_HEADLESS=true
+
+          nohup node "$SIDE/connector.js" >"$LOG" 2>&1 &
+          echo $! >"$PIDFILE"
+          echo "sidecar_pid=$(cat "$PIDFILE")"
+
+          READY=0
+          for i in $(seq 1 90); do
+            if [ -f "$QR_OUT" ] && [ -s "$QR_OUT" ]; then
+              cp -f "$QR_OUT" /tmp/sf-wa-qr.png
+              chmod 600 /tmp/sf-wa-qr.png 2>/dev/null || true
+              READY=1
+              break
+            fi
+            if grep -q '"type":"ready"' "$LOG" 2>/dev/null \
+               || grep -q '"type":"authenticated"' "$LOG" 2>/dev/null; then
+              echo "WA_ALREADY_LINKED=1"
+              READY=2
+              break
+            fi
+            sleep 1
+          done
+          if [ "$READY" = 1 ]; then
+            ls -la /tmp/sf-wa-qr.png
+            echo "QR_PNG_READY=1"
+            grep -oE '"type":"[a-z_]+"' "$LOG" 2>/dev/null | sort | uniq -c | head -20 || true
+          elif [ "$READY" = 2 ]; then
+            echo "QR_PNG_READY=0"
+            echo "session already ready — use wa-status / wa-list-chats"
+          else
+            echo "QR_PNG_READY=0"
+            echo "--- log event types (scrubbed) ---"
+            grep -oE '"type":"[a-z_]+"' "$LOG" 2>/dev/null | sort | uniq -c | head -20 || true
+            exit 1
+          fi
+          exit 0
+          REMOTE
+
+          mkdir -p "$GITHUB_WORKSPACE/sf-wa-qr-out"
+          scp -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 \
+            root@5.189.159.195:/tmp/sf-wa-qr.png \
+            "$GITHUB_WORKSPACE/sf-wa-qr-out/sf-wa-qr.png" 2>/dev/null || true
+          if [ -f "$GITHUB_WORKSPACE/sf-wa-qr-out/sf-wa-qr.png" ]; then
+            echo "PNG fetched for artifact upload"
+            ls -la "$GITHUB_WORKSPACE/sf-wa-qr-out/sf-wa-qr.png"
+          else
+            echo "No QR PNG on host (already linked, expired, or WA_INSTALL_NEEDED)"
+          fi
+          shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519
+
+      - name: Upload WA QR artifact (admin ops)
+        uses: actions/upload-artifact@v4
+        with:
+          name: signal-flow-wa-qr
+          path: sf-wa-qr-out/sf-wa-qr.png
+          if-no-files-found: warn
+          retention-days: 1
