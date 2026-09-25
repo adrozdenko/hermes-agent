@@ -1,13 +1,13 @@
 name: Signal Flow link-diagnose (Contabo)
 
-# Read-only-ish: wipe incomplete self session, run signal-cli link ~25s, scrub output.
+# Wipe incomplete self session; run signal-cli link; time DM; scrub stderr.
 on:
   workflow_dispatch:
 
 jobs:
   diagnose:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 8
     steps:
       - name: Diagnose signal-cli link (scrubbed)
         env:
@@ -19,7 +19,8 @@ jobs:
           printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
-          ssh -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 root@5.189.159.195 'bash -s' <<'REMOTE'
+          ssh -o ConnectTimeout=30 -o ServerAliveInterval=20 -o ServerAliveCountMax=20 \
+            -i ~/.ssh/id_ed25519 root@5.189.159.195 'bash -s' <<'REMOTE'
           set -euo pipefail
           DATA_ROOT=/opt/signal-flow
           APP="$DATA_ROOT/app"
@@ -31,17 +32,22 @@ jobs:
           pkill -f 'sf-admin.*bot-run' 2>/dev/null || true
           pkill -f 'signal-cli.*link' 2>/dev/null || true
           sleep 1
-          "$APP/.venv/bin/python" - <<'PY'
+          export PYTHONUNBUFFERED=1
+          "$APP/.venv/bin/python" -u - <<'PY'
           import os, re, shutil, signal, subprocess, sys, time
           from pathlib import Path
           sys.path.insert(0, "/opt/signal-flow/app")
           from sf.bot_link import (
               DEVICE_NAME_USER,
               is_account_linked,
+              parse_link_uri,
               signal_cli_bin,
-              user_signal_session_dir,
+              write_qr_png,
           )
+          from sf.delivery import send_with_attachment
           from sf.register import resolve_signal_account
+          from sf.bot_link import user_signal_session_dir
+
           root = Path("/opt/signal-flow")
           account = resolve_signal_account(root) or "self"
           sess = user_signal_session_dir(root, account)
@@ -49,53 +55,104 @@ jobs:
               shutil.rmtree(sess)
           sess.mkdir(parents=True)
           bin_path = signal_cli_bin()
-          print("cli=", bool(bin_path), "device_name_set=", bool(DEVICE_NAME_USER))
-          print("java=", shutil.which("java"))
-          # version
+          print("cli=", bool(bin_path), flush=True)
+          print("java=", shutil.which("java"), flush=True)
+          try:
+              mem = Path("/proc/meminfo").read_text()
+              for key in ("MemAvailable", "MemFree"):
+                  if key in mem:
+                      print(key + "=", mem.split(key + ":")[1].split()[0], flush=True)
+                      break
+          except Exception as exc:
+              print("mem_exc=", type(exc).__name__, flush=True)
           try:
               v = subprocess.run([bin_path, "--version"], capture_output=True, text=True, timeout=30)
               blob = (v.stdout or "") + (v.stderr or "")
-              print("cli_version=", re.sub(r"\+?\d{8,15}", "[redacted]", blob.strip())[:120])
+              print("cli_version=", re.sub(r"\+?\d{8,15}", "[redacted]", blob.strip())[:120], flush=True)
           except Exception as exc:
-              print("cli_version_exc=", type(exc).__name__)
+              print("cli_version_exc=", type(exc).__name__, flush=True)
+
+          err_path = sess / "link-stderr.log"
+          err_f = open(err_path, "w", encoding="utf-8")
           cmd = [bin_path, "--config", str(sess), "link", "-n", DEVICE_NAME_USER]
+          t0 = time.monotonic()
           proc = subprocess.Popen(
               cmd,
               stdout=subprocess.PIPE,
-              stderr=subprocess.STDOUT,
+              stderr=err_f,
               text=True,
+              bufsize=1,
               start_new_session=True,
           )
-          lines = []
-          deadline = time.time() + 25
-          while time.time() < deadline:
-              if proc.poll() is not None:
+          uri = None
+          assert proc.stdout is not None
+          while time.monotonic() - t0 < 45 and proc.poll() is None:
+              line = proc.stdout.readline()
+              if not line:
+                  time.sleep(0.05)
+                  continue
+              u = parse_link_uri(line)
+              if u:
+                  uri = u
+                  print("uri_at_s=", round(time.monotonic() - t0, 2), flush=True)
                   break
-              time.sleep(0.3)
-          # drain
-          try:
-              out, _ = proc.communicate(timeout=5)
-          except subprocess.TimeoutExpired:
-              proc.kill()
-              out, _ = proc.communicate(timeout=5)
-          raw = out or ""
-          for line in raw.splitlines():
-              s = line.strip()
-              if not s:
-                  continue
-              if "sgnl://" in s or "linkdevice" in s.lower():
-                  print("out: [link-uri redacted]")
-                  continue
-              s = re.sub(r"\+?\d{8,15}", "[redacted]", s)
-              print("out:", s[:200])
-          print("link_exit=", proc.returncode)
-          print("linked_after=", is_account_linked(sess))
-          # accounts.json size only
+              scrub = re.sub(r"\+?\d{8,15}", "[redacted]", line.strip())
+              if "sgnl://" in scrub or "linkdevice" in scrub.lower():
+                  print("out: [link-uri redacted]", flush=True)
+              elif scrub:
+                  print("out:", scrub[:160], flush=True)
+
+          if not uri:
+              print("FAIL no_uri link_exit=", proc.poll(), flush=True)
+              err_f.flush()
+              for line in err_path.read_text(encoding="utf-8", errors="replace").splitlines()[:30]:
+                  print("err:", re.sub(r"\+?\d{8,15}", "[redacted]", line).replace("sgnl://", "[sgnl]")[:160], flush=True)
+              raise SystemExit(1)
+
+          png = sess / "link-qr.png"
+          write_qr_png(uri, png)
+          print("png_at_s=", round(time.monotonic() - t0, 2), "bytes=", png.stat().st_size, "alive=", proc.poll() is None, flush=True)
+
+          t_send = time.monotonic()
+          sent = send_with_attachment(
+              root,
+              "self",
+              "Signal Flow diagnose: QR нижче. Скануй Linked devices ЗАРАЗ.",
+              png,
+              note_to_self=True,
+          )
+          print(
+              "dm_done_s=", round(time.monotonic() - t0, 2),
+              "dm_took_s=", round(time.monotonic() - t_send, 2),
+              "dm_ok=", sent.ok, "dm_stub=", sent.stub,
+              "alive_after_dm=", proc.poll() is None,
+              flush=True,
+          )
+
+          # Wait for natural exit or 75s more
+          while time.monotonic() - t0 < 120 and proc.poll() is None:
+              time.sleep(3)
+              print("wait_s=", round(time.monotonic() - t0, 1), "alive", flush=True)
+
+          rc = proc.poll()
+          if rc is None:
+              os.killpg(proc.pid, signal.SIGTERM)
+              try:
+                  proc.wait(timeout=5)
+              except Exception:
+                  os.killpg(proc.pid, signal.SIGKILL)
+              print("stopped_no_scan exit=", proc.poll(), "elapsed=", round(time.monotonic() - t0, 1), flush=True)
+          else:
+              print("link_exit=", rc, "elapsed_s=", round(time.monotonic() - t0, 1), flush=True)
+          err_f.close()
+          for line in err_path.read_text(encoding="utf-8", errors="replace").splitlines()[:40]:
+              s = re.sub(r"\+?\d{8,15}", "[redacted]", line).replace("sgnl://", "[sgnl]")
+              if s.strip():
+                  print("err:", s[:180], flush=True)
+          print("linked_after=", is_account_linked(sess), flush=True)
           aj = sess / "data" / "accounts.json"
-          if aj.is_file():
-              print("accounts_json_size=", aj.stat().st_size)
+          print("accounts_json_size=", aj.stat().st_size if aj.is_file() else 0, flush=True)
           PY
-          # restart bot-run
           nohup env PYTHONUNBUFFERED=1 "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli bot-run \
             >/tmp/sf-bot-run.log 2>&1 &
           echo $! >/tmp/sf-bot-run.pid
