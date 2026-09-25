@@ -1,0 +1,91 @@
+name: Signal Flow stream-sync-probe (Contabo)
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: sync + listGroups verbose
+        env:
+          SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
+          HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
+          ssh -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 root@5.189.159.195 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          DATA_ROOT=/opt/signal-flow
+          APP="$DATA_ROOT/app"
+          INGPID=/tmp/sf-ingest-run.pid
+          if [ -f "$INGPID" ]; then OLD=$(cat "$INGPID" 2>/dev/null || true); [ -n "${OLD:-}" ] && kill -0 "$OLD" 2>/dev/null && kill "$OLD" 2>/dev/null || true; fi
+          pkill -f 'sf-admin.*ingest-run' 2>/dev/null || true
+          pkill -f 'signal-cli' 2>/dev/null || true
+          sleep 2
+          ACC=$(python3 -c "import json;print(json.load(open('$DATA_ROOT/config/bot.json')).get('signal_account') or '')")
+          echo "ACC_SET=$([ -n "$ACC" ] && echo yes || echo no)"
+          echo "LINKED=$( [ -d $DATA_ROOT/bot-signal/data ] && echo yes || echo no )"
+          SC=$(command -v signal-cli || true)
+          echo "SIGNAL_CLI=${SC:-missing}"
+          if [ -n "${ACC:-}" ] && [ -n "${SC:-}" ]; then
+            echo "=== receive -t 25 ==="
+            set +e
+            timeout 60 "$SC" -a "$ACC" --config "$DATA_ROOT/bot-signal" receive -t 25 > /tmp/sf-recv.log 2>&1
+            RC=$?
+            set -e
+            echo "RECV_RC=$RC"
+            # sanitize: no phones/sgnl
+            sed -E 's/\+?[0-9]{8,15}/[redacted]/g; /sgnl:\/\//d' /tmp/sf-recv.log | rg -i 'group|Group|insomni|error|Exception|done|Envelope' | head -40 || true
+            echo "RECV_LINES=$(wc -l < /tmp/sf-recv.log)"
+            pkill -f 'signal-cli' 2>/dev/null || true
+            sleep 1
+            echo "=== listGroups json (count) ==="
+            set +e
+            timeout 90 "$SC" -a "$ACC" --config "$DATA_ROOT/bot-signal" -o json listGroups > /tmp/sf-lg.json 2>/tmp/sf-lg.err
+            LRC=$?
+            set -e
+            echo "LIST_RC=$LRC"
+            python3 - <<'PY'
+import json,re
+from pathlib import Path
+raw=Path('/tmp/sf-lg.json').read_text().strip()
+err=Path('/tmp/sf-lg.err').read_text().strip()
+def scrub(s):
+  s=re.sub(r'\+?\d{8,15}','[redacted]',s)
+  return s
+if err:
+  print('LIST_ERR=', scrub(err)[:300])
+if not raw:
+  print('LIST_EMPTY_STDOUT=1')
+else:
+  try:
+    data=json.loads(raw)
+  except Exception as e:
+    print('LIST_PARSE_FAIL', e, 'LEN', len(raw))
+    print(scrub(raw)[:200])
+    data=[]
+  if isinstance(data, dict):
+    data=data.get('groups') or data.get('result') or []
+  print('GROUP_COUNT', len(data) if isinstance(data,list) else type(data))
+  if isinstance(data, list):
+    for g in data[:30]:
+      if not isinstance(g, dict):
+        continue
+      name=g.get('name') or g.get('title') or ''
+      gid=g.get('id') or g.get('groupId') or ''
+      short=(gid[:12]+'…') if len(gid)>12 else gid
+      print(f"GROUP name={name!r} id={short}")
+PY
+            echo "=== sf-admin list-bot-groups ==="
+            "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli list-bot-groups || true
+          fi
+          nohup env PYTHONUNBUFFERED=1 "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli \
+            ingest-run self --receive-timeout 8 --idle-sleep 1 \
+            >/tmp/sf-ingest-run.log 2>&1 &
+          echo $! >/tmp/sf-ingest-run.pid
+          echo INGEST_RUN=restarted
+          REMOTE
+          shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519
