@@ -1,0 +1,297 @@
+name: Signal Flow flow-log diag8 (Contabo)
+
+# Scrubbed: 21:45–21:55 Kyiv (=18:45–18:55Z) dig for 71 опббс / AIR miss.
+# Never prints excerpt/body/phones/sgnl/SSH keys.
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: scrubbed 1845-1855Z 71-опббс AIR dig
+        env:
+          SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
+          HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
+          ssh -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 root@5.189.159.195 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          PYTHONPATH=/opt/signal-flow/app /opt/signal-flow/app/.venv/bin/python - <<'PY'
+          import json, re, sys
+          from collections import Counter
+          from pathlib import Path
+          sys.path.insert(0, "/opt/signal-flow/app")
+          from sf.ingest import resolve_ingest_user
+          from sf.paths import user_dir, channels_path, flow_log_dir
+          from sf.units import (
+              extract_units, normalize_unit_label, message_has_selected_units,
+          )
+          from sf.topics import classify_stream_targets
+          from sf.flows import ensure_default_flow
+          from sf.stream import load_stream_state, stream_is_live
+
+          def scrub(s: str) -> str:
+              s = re.sub(r"\+?\d{8,15}", "[tel]", str(s or ""))
+              s = re.sub(r"sgnl://\S+", "[sgnl]", s)
+              return s
+
+          def label_for(name: str) -> str:
+              fold = (name or "").casefold()
+              if "каменяр" in fold: return "kamenyari"
+              if "альманах" in fold or "almanac" in fold: return "almanac"
+              if "нейтрон" in fold or "neutron" in fold: return "neutron"
+              if "блендер" in fold or "blender" in fold: return "blender"
+              return "other"
+
+          root = Path("/opt/signal-flow")
+          sid, _ = resolve_ingest_user(root, "self")
+          flow = ensure_default_flow(root, sid)
+          f = flow.get("filters") or {}
+          units_sel = list(f.get("units") or [])
+          print("=== FLOW FILTERS ===")
+          print("flow_enabled", bool(flow.get("enabled")))
+          print("sources_n", len(list(flow.get("sources") or [])))
+          print("units_sel_n", len(units_sel))
+          # Report only 71 / бпс / ббс related entries (scrubbed shapes)
+          rel = []
+          for u in units_sel:
+              nu = normalize_unit_label(u)
+              if "71" in nu or "бпс" in nu or "ббс" in nu or "ббпс" in nu:
+                  rel.append({"raw_len": len(str(u)), "norm": nu, "raw_preview": str(u)[:48]})
+          print("units_71_or_bps_related_n", len(rel))
+          for row in rel:
+              print("UNIT_REL", row)
+          has_71_opbps = any(r["norm"] == "71 опбпс" for r in rel)
+          has_71_opbbs = any(r["norm"] == "71 опббс" for r in rel)
+          print("has_norm_71_опбпс", has_71_opbps)
+          print("has_norm_71_опббс", has_71_opbbs)
+
+          # Live match gate: would each form pass message_has_selected_units?
+          for probe in ["71 опббс", "71 опбпс", "71 опБпС", "71 ОпБпС"]:
+              ok, hits = message_has_selected_units(probe, units_sel)
+              units = extract_units(probe)
+              targets = sorted(classify_stream_targets(probe, units=units))
+              print(
+                  "PROBE",
+                  {
+                      "text_norm": normalize_unit_label(probe),
+                      "extract": units,
+                      "filter_ok": ok,
+                      "hits": hits,
+                      "targets_cls": targets,
+                  },
+              )
+
+          label_of = {}
+          try:
+              ch = json.loads(channels_path(root, sid).read_text(encoding="utf-8"))
+              for row in (ch.get("signal") or []):
+                  if isinstance(row, dict) and row.get("key"):
+                      label_of[str(row["key"])] = label_for(str(row.get("name") or ""))
+          except Exception as exc:
+              print("channels_err", type(exc).__name__)
+          print("channel_labels", sorted(set(label_of.values())), "n", len(label_of))
+
+          log = flow_log_dir(root, sid) / "2026-09-25.jsonl"
+          print("log_exists", log.is_file(), "bytes", log.stat().st_size if log.is_file() else 0)
+
+          # Window: 21:45-21:55 Kyiv = 18:45-18:55 UTC
+          win_lo, win_hi = "18:45", "18:55"
+          # Slightly wider for clock skew
+          wide_lo, wide_hi = "18:40", "19:00"
+          win_rows = []
+          wide_hits = []
+          day_71 = []
+          day_air = Counter()
+          day_targets = Counter()
+
+          def unit_flags(ex: str) -> dict:
+              low = (ex or "").casefold()
+              units = extract_units(ex or "")
+              norms = [normalize_unit_label(u) for u in units]
+              return {
+                  "units": units,
+                  "has_71": any(n.startswith("71 ") or n == "71" for n in norms),
+                  "has_opbbs": any("опббс" in n for n in norms) or ("опббс" in low),
+                  "has_opbps": any("опбпс" in n for n in norms) or ("опбпс" in low),
+                  "has_60_ombr": bool(re.search(r"(?<!\d)60\s*омбр", low)),
+                  "targets_cls": sorted(classify_stream_targets(ex or "", units=units)),
+              }
+
+          if log.is_file():
+              with log.open(encoding="utf-8", errors="replace") as fh:
+                  for line in fh:
+                      line = line.strip()
+                      if not line:
+                          continue
+                      try:
+                          r = json.loads(line)
+                      except Exception:
+                          continue
+                      la = str(r.get("logged_at") or "")
+                      if not la.startswith("2026-09-25T"):
+                          continue
+                      hhmm = la[11:16] if len(la) >= 16 else ""
+                      ex = str(r.get("excerpt") or "")
+                      # Never keep excerpt beyond flag scan
+                      uf = unit_flags(ex)
+                      sk = str(r.get("source_key") or "")
+                      lab = label_of.get(sk, "unk")
+                      rs = r.get("reasons") or []
+                      rs_s = [str(x)[:80] for x in (rs[:5] if isinstance(rs, list) else [])]
+                      reason_blob = " ".join(rs_s).casefold()
+                      gt = r.get("group_targets")
+                      skipped = r.get("skipped_sinks")
+                      meta = {
+                          "t": la[11:19] if len(la) >= 19 else la,
+                          "lab": lab,
+                          "reasons": rs_s,
+                          "group_targets": gt,
+                          "skipped": skipped,
+                          "dedup_fp": bool(r.get("dedup_fingerprint") or r.get("fingerprint_suppressed")),
+                          "group_failed": bool(r.get("group_failed")),
+                          "units": uf["units"],
+                          "has_71": uf["has_71"],
+                          "has_opbbs": uf["has_opbbs"],
+                          "has_opbps": uf["has_opbps"],
+                          "has_60_ombr": uf["has_60_ombr"],
+                          "targets_cls": uf["targets_cls"],
+                          "excerpt_len": len(ex),
+                          "reason_has_71": "71" in reason_blob,
+                          "reason_has_opb": ("опббс" in reason_blob) or ("опбпс" in reason_blob) or ("опбпс" in reason_blob),
+                      }
+                      for t in (gt or ["(none)"]):
+                          day_targets[str(t)] += 1
+                          if str(t) == "air":
+                              day_air[lab] += 1
+                      hit71 = (
+                          uf["has_71"] or uf["has_opbbs"] or uf["has_opbps"]
+                          or meta["reason_has_71"] or meta["reason_has_opb"]
+                      )
+                      if hit71:
+                          day_71.append(meta)
+                      if wide_lo <= hhmm <= wide_hi and hit71:
+                          wide_hits.append(meta)
+                      if win_lo <= hhmm <= win_hi:
+                          win_rows.append(meta)
+
+          print("=== WINDOW 18:45-18:55Z (==21:45-21:55 Kyiv) ===")
+          print("window_rows", len(win_rows))
+          print("window_by_label", dict(Counter(m["lab"] for m in win_rows)))
+          print("window_by_target", dict(Counter(str(t) for m in win_rows for t in (m.get("group_targets") or ["(none)"]))))
+          print("window_skip_classes", dict(Counter(
+              str(s).split(":")[0] for m in win_rows for s in (m.get("skipped") or [])
+          )))
+          print("window_fp_n", sum(1 for m in win_rows if m["dedup_fp"]))
+          print("window_group_failed_n", sum(1 for m in win_rows if m["group_failed"]))
+          print("window_hit71_n", sum(1 for m in win_rows if m["has_71"] or m["has_opbbs"] or m["has_opbps"] or m["reason_has_71"]))
+          print("--- window meta (no excerpt) ---")
+          for m in win_rows:
+              print({k: m[k] for k in (
+                  "t","lab","reasons","group_targets","skipped","dedup_fp","group_failed",
+                  "units","has_71","has_opbbs","has_opbps","has_60_ombr","targets_cls","excerpt_len",
+                  "reason_has_71","reason_has_opb",
+              )})
+
+          print("=== WIDE 18:40-19:00Z hits with 71/опб* ===")
+          print("wide_hit71_n", len(wide_hits))
+          for m in wide_hits:
+              print({k: m[k] for k in (
+                  "t","lab","reasons","group_targets","skipped","dedup_fp",
+                  "units","has_71","has_opbbs","has_opbps","has_60_ombr","targets_cls","excerpt_len",
+              )})
+
+          print("=== DAY rows mentioning 71/опб* (matched only) ===")
+          print("day_71_n", len(day_71))
+          print("day_71_by_label", dict(Counter(m["lab"] for m in day_71)))
+          print("day_71_by_target", dict(Counter(str(t) for m in day_71 for t in (m.get("group_targets") or ["(none)"]))))
+          for m in day_71[-25:]:
+              print({k: m[k] for k in (
+                  "t","lab","reasons","group_targets","skipped","dedup_fp",
+                  "units","has_71","has_opbbs","has_opbps","targets_cls","excerpt_len",
+              )})
+
+          print("=== DAY air sink counts by label ===")
+          print(dict(day_air))
+          print("=== DAY group_targets histogram ===")
+          print(dict(day_targets))
+
+          # Stream / air sink health
+          st = load_stream_state(root)
+          print("=== STREAM ===")
+          print("stream_live", stream_is_live(st), "updated", st.get("updated_at"))
+          targets = st.get("targets") or {}
+          for k in ("default", "arta", "air"):
+              t = targets.get(k) or {}
+              gid = str(t.get("group_id") or "")
+              print(
+                  f"sink_{k}",
+                  "en=", bool(t.get("enabled")),
+                  "gid_len=", len(gid),
+                  "name_set=", bool(t.get("group_name")),
+              )
+
+          # Ingest log: group_error / air around window
+          print("=== INGEST LOG around window (scrubbed) ===")
+          ud = user_dir(root, sid)
+          found = []
+          for c in list(Path("/tmp").glob("sf-ingest*")) + [
+              ud / "data" / "ingest.log",
+              Path("/var/log/signal-flow/ingest.log"),
+          ]:
+              if c.is_file():
+                  found.append(c)
+          print("ingest_log_candidates", [(c.name, c.stat().st_size) for c in found])
+          group_sent = Counter()
+          group_err = Counter()
+          air_err_near = 0
+          fp_air = 0
+          near_lines = []
+          for c in found:
+              for ln in c.read_text(errors="replace").splitlines():
+                  s = scrub(ln)
+                  if "group_sent:" in s:
+                      m = re.search(r"group_sent:(\w+)", s)
+                      if m:
+                          group_sent[m.group(1)] += 1
+                  if "group_error:" in s:
+                      m = re.search(r"group_error:(\w+)", s)
+                      sink = m.group(1) if m else "?"
+                      if "Invalid group id" in s or "base64" in s:
+                          cls = "bad_group_id"
+                      elif "LockedException" in s or "Config file is in use" in s:
+                          cls = "locked"
+                      elif "Unauthorized" in s:
+                          cls = "unauthorized"
+                      else:
+                          cls = "other"
+                      group_err[f"{sink}:{cls}"] += 1
+                  if ("18:4" in s or "18:5" in s or "21:4" in s or "21:5" in s) and any(
+                      x in s for x in ("group_", "fingerprint", "skipped", "matched=", "dropped=", "air")
+                  ):
+                      if len(s) > 220:
+                          s = s[:220] + "…"
+                      near_lines.append(s)
+                  if "fingerprint" in s.lower() and "air" in s.lower():
+                      fp_air += 1
+                  if "group_error:air" in s and ("18:4" in s or "18:5" in s):
+                      air_err_near += 1
+          print("group_sent_by_sink", dict(group_sent))
+          print("group_err_classes", dict(group_err))
+          print("fingerprint_air_mentions", fp_air)
+          print("air_err_near_184x", air_err_near)
+          print("near_window_log_n", len(near_lines))
+          for ln in near_lines[-40:]:
+              print(ln)
+
+          print("NOTE: flow-log stores MATCHES only; unit-gate DROPS leave no row.")
+          print("DIAG8_DONE")
+          PY
+          REMOTE
+          shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519
