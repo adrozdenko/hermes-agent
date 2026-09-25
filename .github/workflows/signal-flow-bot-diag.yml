@@ -1,0 +1,72 @@
+name: Signal Flow bot-diag (Contabo)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Diagnose bot-run
+        env:
+          SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
+          HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
+          ssh -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 root@5.189.159.195 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          DATA_ROOT=/opt/signal-flow
+          APP="$DATA_ROOT/app"
+          PIDFILE=/tmp/sf-bot-run.pid
+          LOG=/tmp/sf-bot-run.log
+          echo "=== process ==="
+          if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+            echo "BOT_RUN=alive pid=$(cat "$PIDFILE")"
+          else
+            echo "BOT_RUN=dead"
+            pgrep -af 'bot-run|signal-cli' || true
+          fi
+          echo "=== bot-link-status ==="
+          "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli bot-link-status || true
+          echo "=== bot.json signal_account key present? ==="
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          p=Path("/opt/signal-flow/config/bot.json")
+          d=json.loads(p.read_text()) if p.is_file() else {}
+          sa=d.get("signal_account")
+          print("signal_account_set=", bool(sa and str(sa).strip() and "PLACEHOLDER" not in str(sa).upper()))
+          print("keys=", sorted(d.keys()))
+          PY
+          echo "=== account dir markers (no secrets) ==="
+          ls -la /opt/signal-flow/bot-signal/ 2>/dev/null | head -20
+          # List data filenames only, not contents
+          find /opt/signal-flow/bot-signal/data -maxdepth 2 -type f -printf '%f\n' 2>/dev/null | head -30 || true
+          echo "=== sf-bot-run.log (redacted phones, strip sgnl) ==="
+          if [ -f "$LOG" ]; then
+            sed -E 's/\+?[0-9]{8,15}/[redacted]/g; /sgnl:\/\//d' "$LOG" | tail -n 80
+          else
+            echo "no log"
+          fi
+          echo "=== one-shot receive dry (5s) stderr only summary ==="
+          # Try to see if signal-cli receive errors; do not dump message bodies
+          ACCOUNT_HINT=$("$APP/.venv/bin/python" - <<'PY'
+          from pathlib import Path
+          import sys
+          sys.path.insert(0,"/opt/signal-flow/app")
+          try:
+            from sf.register import resolve_signal_account
+            print(resolve_signal_account(Path("/opt/signal-flow")) or "")
+          except Exception as e:
+            print("ERR:"+type(e).__name__)
+          PY
+          )
+          echo "resolve_account_ok=$([ -n \"$ACCOUNT_HINT\" ] && [ \"${ACCOUNT_HINT#ERR:}\" = \"$ACCOUNT_HINT\" ] && echo yes || echo no)"
+          echo "resolve_prefix=$(printf '%s' "$ACCOUNT_HINT" | head -c 4)"
+          REMOTE
+          shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519
