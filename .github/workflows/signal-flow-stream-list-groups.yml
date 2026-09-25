@@ -1,6 +1,5 @@
 name: Signal Flow stream-list-groups (Contabo)
 
-# List groups visible to bot-signal (names + short ids; no phones).
 on:
   workflow_dispatch:
 
@@ -32,20 +31,53 @@ jobs:
           pkill -f 'signal-cli' 2>/dev/null || true
           sleep 2
           ACC=$(python3 -c "import json;print(json.load(open('/opt/signal-flow/config/bot.json')).get('signal_account') or '')")
-          SC=$(command -v signal-cli || true)
-          echo "ACC_SET=$([ -n "$ACC" ] && echo yes || echo no) SIGNAL_CLI=${SC:-missing}"
+          for c in /opt/signal-flow/bin/signal-cli /usr/local/bin/signal-cli /usr/bin/signal-cli; do
+            if [ -x "$c" ]; then SC=$c; break; fi
+          done
+          SC=${SC:-$(command -v signal-cli || true)}
+          echo "ACC_SET=$([ -n "$ACC" ] && echo yes || echo no)"
+          echo "SIGNAL_CLI=${SC:-missing}"
+          echo "BOT_DATA=$([ -d $DATA_ROOT/bot-signal/data ] && echo present || echo empty)"
           if [ -n "${ACC:-}" ] && [ -n "${SC:-}" ]; then
             echo "=== bot-signal receive sync (30s) ==="
             set +e
             timeout 70 "$SC" -a "$ACC" --config "$DATA_ROOT/bot-signal" receive -t 30 >/tmp/sf-recv.log 2>&1
             echo "RECV_RC=$?"
             set -e
-            sed -E 's/\+?[0-9]{8,15}/[redacted]/g; /sgnl:\/\//d' /tmp/sf-recv.log | grep -Ei 'group|insomni|error|Exception|Synced' | head -30 || true
+            sed -E 's/\+?[0-9]{8,15}/[redacted]/g; /sgnl:\/\//d' /tmp/sf-recv.log | grep -Ei 'group|insomni|error|Exception|Synced|Failed' | head -40 || true
             echo "RECV_LINES=$(wc -l < /tmp/sf-recv.log)"
             pkill -f 'signal-cli' 2>/dev/null || true
             sleep 1
+            echo "=== raw listGroups ==="
+            set +e
+            timeout 90 "$SC" -a "$ACC" --config "$DATA_ROOT/bot-signal" -o json listGroups >/tmp/sf-lg.json 2>/tmp/sf-lg.err
+            echo "LIST_RC=$?"
+            set -e
+            python3 -c '
+import json,re
+from pathlib import Path
+raw=Path("/tmp/sf-lg.json").read_text().strip()
+err=Path("/tmp/sf-lg.err").read_text().strip()
+scrub=lambda s: re.sub(r"\+?\d{8,15}","[redacted]",s)
+print("ERR", scrub(err)[:300] if err else "")
+print("RAW_LEN", len(raw))
+if raw:
+  try:
+    data=json.loads(raw)
+  except Exception as e:
+    print("PARSE", e); data=[]
+  if isinstance(data, dict):
+    data=data.get("groups") or data.get("result") or []
+  print("COUNT", len(data) if isinstance(data,list) else type(data))
+  if isinstance(data,list):
+    for g in data[:40]:
+      if isinstance(g,dict):
+        n=g.get("name") or g.get("title") or ""
+        i=str(g.get("id") or g.get("groupId") or "")
+        print("GROUP", repr(n), i[:20]+("…" if len(i)>20 else ""))
+'
           fi
-          echo "=== list-bot-groups ==="
+          echo "=== sf-admin list-bot-groups ==="
           "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli list-bot-groups || true
           nohup env PYTHONUNBUFFERED=1 "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli \
             ingest-run self --receive-timeout 8 --idle-sleep 1 \
