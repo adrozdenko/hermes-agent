@@ -97,8 +97,8 @@ jobs:
           print("has_fc=", has_fire_control(text), flush=True)
 
           # Half-signals must drop
-          half_sight = {"source_key": sk, "text": "нв невідома — тільки прицел", "id": "h1", "timestamp": 1}
-          half_fire = {"source_key": sk, "text": "нв невідома — тільки огонь", "id": "h2", "timestamp": 1}
+          half_sight = {"source_key": sk, "text": "без хедера — тільки прицел", "id": "h1", "timestamp": 1}
+          half_fire = {"source_key": sk, "text": "без хедера — тільки огонь", "id": "h2", "timestamp": 1}
           ok_s, _ = match_flow(stub_flow, half_sight)
           ok_f, _ = match_flow(stub_flow, half_fire)
           print("half_sight_drop=", (not ok_s), flush=True)
