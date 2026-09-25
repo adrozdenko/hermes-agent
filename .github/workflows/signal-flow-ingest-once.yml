@@ -41,7 +41,9 @@ jobs:
             [ -n "${OLD:-}" ] && kill -0 "$OLD" 2>/dev/null && kill "$OLD" 2>/dev/null || true
           fi
           pkill -f 'sf-admin.*bot-run' 2>/dev/null || true
-          sleep 1
+          # Orphan signal-cli (Java) from timed-out receives holds account.db locks
+          pkill -f 'signal-cli' 2>/dev/null || true
+          sleep 2
           EXTRA=()
           if [ "${DRY_RUN}" = "true" ]; then
             EXTRA+=(--dry-run)
