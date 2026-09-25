@@ -8,6 +8,11 @@ name: Signal Flow bot-link (Contabo bootstrap)
 
 on:
   workflow_dispatch:
+    inputs:
+      clear_session:
+        description: "Wipe bot-signal/data first (SMS leftovers look linked; use for Drozd.33 QR relink)"
+        type: boolean
+        default: false
 
 jobs:
   bot-link:
@@ -18,6 +23,7 @@ jobs:
         env:
           SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
           HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
+          CLEAR_SESSION: ${{ inputs.clear_session }}
         run: |
           set -euo pipefail
           if [ -z "${SSH_KEY:-}" ] || [ -z "${HOST_KEY:-}" ]; then
@@ -29,6 +35,20 @@ jobs:
           printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
+
+          if [ "${CLEAR_SESSION:-false}" = "true" ]; then
+            echo "clear_session=true — wiping Contabo bot-signal/data (SMS leftovers)"
+            ssh -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 root@5.189.159.195 'bash -s' <<'WIPE'
+            set -euo pipefail
+            ACCOUNT=/opt/signal-flow/bot-signal
+            test -d "$ACCOUNT" || { echo "bot-signal missing" >&2; exit 1; }
+            rm -rf "$ACCOUNT/data"
+            rm -f "$ACCOUNT/.bot-link.pid"
+            mkdir -p "$ACCOUNT/data"
+            chmod 700 "$ACCOUNT" "$ACCOUNT/data"
+            echo "session cleared (data/ empty)"
+            WIPE
+          fi
 
           ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=40 \
               -o TCPKeepAlive=yes -o ConnectTimeout=30 \
