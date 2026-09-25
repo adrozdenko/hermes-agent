@@ -60,6 +60,14 @@ jobs:
             echo "WA_CONNECTOR_MISSING=1" >&2
             exit 2
           fi
+          # install-signal-flow-app replaces app/ and drops node_modules — restore lightly
+          if [ ! -d "$APP/whatsapp_sidecar/node_modules/whatsapp-web.js" ]; then
+            echo "WA_NODE_MODULES_MISSING=1 — running npm ci"
+            cd "$APP/whatsapp_sidecar"
+            if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi
+            cd /
+          fi
+          echo "node_modules_ok=$([ -d "$APP/whatsapp_sidecar/node_modules/whatsapp-web.js" ] && echo 1 || echo 0)"
 
           # Stop prior wa-ingest only (NOT Signal ingest)
           if [ -f "$PIDFILE" ]; then
