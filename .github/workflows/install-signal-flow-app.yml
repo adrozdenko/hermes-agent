@@ -2,6 +2,9 @@ name: Install Signal Flow app (Contabo)
 
 # Clone private adrozdenko/signal-flow onto Contabo and pip-install sf-admin.
 # Manual only. Does not rebuild Hermes. Does not print secrets or admin id.
+# Install always restarts ingest-run; bot-run stays stopped.
+# Stream sinks live in bot-signal/stream.json under DATA_ROOT (outside app/), so
+# replacing app/ does not wipe default/arta/air; we verify after install.
 
 on:
   workflow_dispatch:
@@ -9,6 +12,7 @@ on:
 jobs:
   install-app:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Clone signal-flow with deploy key
         env:
@@ -42,9 +46,13 @@ jobs:
           set -euo pipefail
           DATA_ROOT=/opt/signal-flow
           APP="$DATA_ROOT/app"
+          STREAM_JSON="$DATA_ROOT/bot-signal/stream.json"
+          PIDFILE=/tmp/sf-ingest-run.pid
+          BOTPID=/tmp/sf-bot-run.pid
+          LOG=/tmp/sf-ingest-run.log
           test -d "$DATA_ROOT/config" || { echo "layout missing; run install-signal-flow-layout first" >&2; exit 1; }
           # Release .venv file locks before replace (ingest / signal-cli hold them open)
-          for f in /tmp/sf-ingest-run.pid /tmp/sf-bot-run.pid; do
+          for f in "$PIDFILE" "$BOTPID"; do
             if [ -f "$f" ]; then
               OLD=$(cat "$f" 2>/dev/null || true)
               [ -n "${OLD:-}" ] && kill -0 "$OLD" 2>/dev/null && kill "$OLD" 2>/dev/null || true
@@ -68,7 +76,62 @@ jobs:
           exec /opt/signal-flow/app/.venv/bin/sf-admin --data-root /opt/signal-flow "$@"
           WRAP
           chmod 755 /usr/local/bin/sf-admin
-          echo "install-signal-flow-app: done"
+          echo "install-signal-flow-app: pip done"
+
+          # Stream state is outside app/ (bot-signal/stream.json) — must survive replace
+          echo "=== stream state path check ==="
+          if [ -f "$STREAM_JSON" ]; then
+            echo "STREAM_JSON=present path=$STREAM_JSON (outside app/; survived install)"
+            python3 - <<'PY'
+          import json
+          from pathlib import Path
+          p = Path("/opt/signal-flow/bot-signal/stream.json")
+          data = json.loads(p.read_text(encoding="utf-8"))
+          targets = data.get("targets") or {}
+          for key in ("default", "arta", "air"):
+              t = targets.get(key) or {}
+              en = bool(t.get("enabled")) and bool(str(t.get("group_id") or "").strip())
+              name = (t.get("group_name") or "").strip() or "(unnamed)"
+              # group names only — no phones, no full group ids
+              print(f"  sink {key}: enabled={en} group_name={name}")
+          missing = [k for k in ("default", "arta", "air")
+                     if not (bool((targets.get(k) or {}).get("enabled"))
+                             and bool(str((targets.get(k) or {}).get("group_id") or "").strip()))]
+          if missing:
+              print(f"WARN sinks not fully enabled: {','.join(missing)} — re-run stream-start for those targets")
+          else:
+              print("STREAM_SINKS=ok default,arta,air enabled")
+          PY
+          else
+            echo "WARN STREAM_JSON=missing path=$STREAM_JSON — sinks wiped or never seeded; re-run stream-start"
+          fi
+
+          # Same nohup/sf-admin flags as signal-flow-ingest-start.yml
+          echo "=== ingest-start (post-install) ==="
+          # bot-run must stay stopped (ingest owns delivery)
+          if [ -f "$BOTPID" ]; then
+            OLD=$(cat "$BOTPID" 2>/dev/null || true)
+            [ -n "${OLD:-}" ] && kill -0 "$OLD" 2>/dev/null && kill "$OLD" 2>/dev/null || true
+          fi
+          pkill -f 'sf-admin.*bot-run' 2>/dev/null || true
+          nohup env PYTHONUNBUFFERED=1 "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli \
+            ingest-run self --receive-timeout 8 --idle-sleep 1 \
+            >"$LOG" 2>&1 &
+          echo $! >"$PIDFILE"
+          sleep 2
+          if kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+            echo INGEST_RUN=alive pid=$(cat "$PIDFILE")
+          else
+            echo INGEST_RUN=dead
+            sed -E 's/\+?[0-9]{8,15}/[redacted]/g; /sgnl:\/\//d' "$LOG" | tail -n 30 || true
+            exit 1
+          fi
+          echo BOT_RUN=stopped
+          sed -E 's/\+?[0-9]{8,15}/[redacted]/g; /sgnl:\/\//d' "$LOG" | tail -n 15 || true
+
+          echo "=== stream-status (post-install) ==="
+          "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli stream-status
+          echo "install-signal-flow-app: done (ingest restored; bot-run stopped)"
           ls -la "$DATA_ROOT" "$APP" | head -40
           REMOTE
           shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519
