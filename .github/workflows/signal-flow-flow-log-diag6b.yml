@@ -1,0 +1,106 @@
+name: Signal Flow flow-log diag6b (Contabo)
+on:
+  workflow_dispatch:
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: place yes/no for 488 window (scrubbed)
+        env:
+          SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
+          HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
+          ssh -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 root@5.189.159.195 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          PYTHONPATH=/opt/signal-flow/app /opt/signal-flow/app/.venv/bin/python - <<'PY'
+          import json, re, sys
+          from pathlib import Path
+          sys.path.insert(0, "/opt/signal-flow/app")
+          from sf.ingest import resolve_ingest_user
+          from sf.paths import user_dir, channels_path, flow_log_dir
+
+          def label_for(name: str) -> str:
+              fold = (name or "").casefold()
+              if "каменяр" in fold: return "kamenyari"
+              if "альманах" in fold or "almanac" in fold: return "almanac"
+              if "нейтрон" in fold or "neutron" in fold: return "neutron"
+              if "блендер" in fold or "blender" in fold: return "blender"
+              return "other"
+
+          root = Path("/opt/signal-flow")
+          sid, _ = resolve_ingest_user(root, "self")
+          label_of = {}
+          try:
+              ch = json.loads(channels_path(root, sid).read_text(encoding="utf-8"))
+              for row in (ch.get("signal") or []):
+                  if isinstance(row, dict) and row.get("key"):
+                      label_of[str(row["key"])] = label_for(str(row.get("name") or ""))
+          except Exception as exc:
+              print("channels_err", type(exc).__name__)
+
+          log = flow_log_dir(root, sid) / "2026-09-25.jsonl"
+          places = ("черкиз", "іванів", "иванов", "ivanov", "cherkiz")
+          ombr = ("60 омбр", "60омбр", "60 омбр")
+          hits = []
+          with log.open(encoding="utf-8", errors="replace") as fh:
+              for line in fh:
+                  line=line.strip()
+                  if not line: continue
+                  try: r=json.loads(line)
+                  except Exception: continue
+                  la=str(r.get("logged_at") or "")
+                  if not la.startswith("2026-09-25T17:"):
+                      continue
+                  hhmm=la[11:16] if len(la)>=16 else ""
+                  if hhmm < "17:30" or hhmm > "17:45":
+                      continue
+                  rs=r.get("reasons") or []
+                  if not any("488" in str(x) for x in rs):
+                      continue
+                  # excerpt is stored truncated — check place markers without printing it
+                  ex=str(r.get("excerpt") or "").casefold()
+                  # also reasons string
+                  blob = ex + " " + " ".join(str(x).casefold() for x in rs)
+                  place_yes = any(p in blob for p in places)
+                  ombr_yes = any(o in blob for o in ombr) or ("омбр" in blob and "60" in blob)
+                  sk=str(r.get("source_key") or "")
+                  hits.append({
+                      "t": la[11:19],
+                      "lab": label_of.get(sk,"unk"),
+                      "targets": r.get("group_targets"),
+                      "skipped": r.get("skipped_sinks"),
+                      "place": place_yes,
+                      "ombr60": ombr_yes,
+                      "excerpt_len": len(ex),
+                  })
+          print("488_window_rows", len(hits))
+          for h in hits:
+              print(h)
+          print("place_yes_n", sum(1 for h in hits if h["place"]))
+          print("ombr60_yes_n", sum(1 for h in hits if h["ombr60"]))
+          # attach path code confirmation counts from details in ingest log files
+          ud = user_dir(root, sid)
+          found=[]
+          for c in list(Path("/tmp").glob("sf-ingest*"))+[ud/"data"/"ingest.log"]:
+              if c.is_file(): found.append(c)
+          att_miss=0; sent_default=0; sent_arta=0; sent_air=0; err_air=0; err_other=0
+          for c in found:
+              for ln in c.read_text(errors="replace").splitlines():
+                  if "attach_missing" in ln: att_miss += 1
+                  if "group_sent:default" in ln: sent_default += 1
+                  if "group_sent:arta" in ln: sent_arta += 1
+                  if "group_sent:air" in ln: sent_air += 1
+                  if "group_error:air" in ln: err_air += 1
+                  elif "group_error:" in ln: err_other += 1
+          print("detail_attach_missing", att_miss)
+          print("detail_group_sent_default", sent_default, "arta", sent_arta, "air", sent_air)
+          print("detail_group_error_air", err_air, "other", err_other)
+          PY
+          REMOTE
+          shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519
