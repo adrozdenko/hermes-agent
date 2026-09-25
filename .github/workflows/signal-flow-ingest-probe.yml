@@ -1,13 +1,13 @@
 name: Signal Flow ingest-probe (Contabo)
 
-# Scrubbed: accounts.json shape + listAccounts + receive rc (personal vs bot).
+# Scrubbed: locks, processes, personal vs bot receive timing.
 on:
   workflow_dispatch:
 
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 6
     steps:
       - name: Probe personal vs bot receive
         env:
@@ -29,13 +29,17 @@ jobs:
             [ -n "${OLD:-}" ] && kill -0 "$OLD" 2>/dev/null && kill "$OLD" 2>/dev/null || true
           fi
           pkill -f 'sf-admin.*bot-run' 2>/dev/null || true
-          sleep 1
+          pkill -f 'signal-cli' 2>/dev/null || true
+          sleep 2
+          echo "=== procs after kill ==="
+          pgrep -af 'signal-cli|sf-admin' | sed -E 's/\+?[0-9]{8,15}/[redacted]/g' | head -20 || echo none
           export PYTHONUNBUFFERED=1
           "$APP/.venv/bin/python" -u - <<'PY'
-          import json, re, subprocess, sys
+          import json, re, subprocess, sys, time
           from pathlib import Path
           sys.path.insert(0, "/opt/signal-flow/app")
           from sf.bot_link import signal_cli_bin, user_signal_session_dir, is_account_linked
+          from sf.ingest import read_session_account
           from sf.paths import bot_signal_dir
           from sf.register import resolve_signal_account
 
@@ -48,118 +52,45 @@ jobs:
               )
               return s
 
-          def shape_accounts(cfg: Path) -> None:
-              p = cfg / "data" / "accounts.json"
-              print("cfg=", scrub(str(cfg.name if False else cfg)), "exists=", p.is_file(), "linked=", is_account_linked(cfg), flush=True)
-              if not p.is_file():
-                  return
-              raw = p.read_text(encoding="utf-8", errors="replace")
-              print("accounts_json_size=", len(raw), flush=True)
+          def locks(cfg: Path) -> None:
+              print("locks for", scrub(str(cfg)), flush=True)
+              for p in cfg.rglob("*"):
+                  name = p.name.lower()
+                  if p.is_file() and ("lock" in name or name.endswith(".lck") or name == "LOCK"):
+                      print("  lockfile", scrub(str(p.relative_to(cfg))), "size", p.stat().st_size, flush=True)
+
+          def timed_receive(label: str, cfg: Path, account: str, t: int = 5) -> None:
+              bin_path = signal_cli_bin()
+              print(f"--- {label} receive t={t} ---", flush=True)
+              cmd = [bin_path, "-a", account, "--config", str(cfg), "-o", "json", "receive", "-t", str(t)]
+              t0 = time.monotonic()
               try:
-                  payload = json.loads(raw)
-              except Exception as exc:
-                  print("accounts_json_parse=", type(exc).__name__, flush=True)
-                  return
-              acc = payload.get("accounts") if isinstance(payload, dict) else None
-              if not isinstance(acc, list):
-                  print("accounts_not_list", flush=True)
-                  return
-              print("accounts_n=", len(acc), flush=True)
-              for i, a in enumerate(acc):
-                  if not isinstance(a, dict):
-                      print(f"  [{i}] type={type(a).__name__}", flush=True)
-                      continue
-                  keys = sorted(a.keys())
-                  number = a.get("number") or a.get("pniNumber") or ""
-                  uuid = a.get("uuid") or a.get("aci") or ""
-                  path = a.get("path") or ""
-                  print(
-                      f"  [{i}] keys={keys} number_len={len(str(number))} "
-                      f"number_has_plus={str(number).startswith('+')} "
-                      f"uuid_len={len(str(uuid))} path={scrub(str(path))}",
-                      flush=True,
-                  )
-
-          def account_candidates(cfg: Path, account: str) -> list[tuple[str, str]]:
-              out: list[tuple[str, str]] = []
-              if account:
-                  out.append(("resolve", account))
-              p = cfg / "data" / "accounts.json"
-              if p.is_file():
-                  try:
-                      payload = json.loads(p.read_text(encoding="utf-8"))
-                      for a in (payload.get("accounts") or []):
-                          if not isinstance(a, dict):
-                              continue
-                          num = a.get("number") or ""
-                          uuid = a.get("uuid") or a.get("aci") or ""
-                          if num:
-                              out.append(("json_number", str(num)))
-                          if uuid:
-                              out.append(("json_uuid", str(uuid)))
-                  except Exception:
-                      pass
-              # dedupe by value, keep first label
-              seen = set()
-              uniq = []
-              for label, val in out:
-                  if val in seen:
-                      continue
-                  seen.add(val)
-                  uniq.append((label, val))
-              return uniq
-
-          def try_receive(label: str, cfg: Path, account: str, timeout: int = 6) -> None:
-              bin_path = signal_cli_bin()
-              print(f"--- receive {label} ---", flush=True)
-              if not bin_path:
-                  print("skip missing bin", flush=True)
-                  return
-              for kind, aflag in account_candidates(cfg, account):
-                  cmd = [bin_path, "-a", aflag, "--config", str(cfg), "-o", "json", "receive", "-t", str(timeout)]
-                  try:
-                      proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 25)
-                  except Exception as exc:
-                      print("kind=", kind, "exc=", type(exc).__name__, scrub(str(exc)), flush=True)
-                      continue
-                  out_lines = [ln for ln in (proc.stdout or "").splitlines() if ln.strip()]
-                  err = scrub((proc.stderr or "").strip())[-240:]
-                  print(
-                      f"kind={kind} a_len={len(aflag)} a_plus={aflag.startswith('+')} "
-                      f"a_uuidish={('-' in aflag and len(aflag) >= 32)} rc={proc.returncode} "
-                      f"stdout_lines={len(out_lines)} stderr={err!r}",
-                      flush=True,
-                  )
-
-          def list_accounts(label: str, cfg: Path) -> None:
-              bin_path = signal_cli_bin()
-              print(f"--- listAccounts {label} ---", flush=True)
-              if not bin_path:
-                  return
-              for cmd in (
-                  [bin_path, "--config", str(cfg), "listAccounts"],
-                  [bin_path, "--config", str(cfg), "accounts"],
-              ):
-                  try:
-                      proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-                  except Exception as exc:
-                      print("cmd", cmd[-1], "exc", type(exc).__name__, flush=True)
-                      continue
-                  blob = scrub((proc.stdout or "") + "\n" + (proc.stderr or ""))
-                  print(f"cmd={cmd[-1]} rc={proc.returncode} out={blob[:400]!r}", flush=True)
+                  proc = subprocess.run(cmd, capture_output=True, text=True, timeout=t + 20)
+                  dt = round(time.monotonic() - t0, 2)
+                  err = scrub((proc.stderr or "").strip())[-300:]
+                  n = len([ln for ln in (proc.stdout or "").splitlines() if ln.strip()])
+                  print(f"rc={proc.returncode} dt={dt}s lines={n} stderr={err!r}", flush=True)
+              except subprocess.TimeoutExpired as exc:
+                  dt = round(time.monotonic() - t0, 2)
+                  print(f"TIMEOUT dt={dt}s partial_err={scrub(str(exc.stderr or ''))[:200]!r}", flush=True)
 
           root = Path("/opt/signal-flow")
-          account = resolve_signal_account(root) or ""
-          print("resolve_account_len=", len(account), "plus=", account.startswith("+"), flush=True)
-          personal = user_signal_session_dir(root, account)
+          resolve = resolve_signal_account(root) or ""
+          personal = user_signal_session_dir(root, resolve)
           bot = bot_signal_dir(root)
-          print("personal=", scrub(str(personal)), flush=True)
-          shape_accounts(personal)
-          shape_accounts(bot)
-          list_accounts("personal", personal)
-          list_accounts("bot", bot)
-          try_receive("personal", personal, account)
-          try_receive("bot", bot, account)
+          sess_acct = read_session_account(personal) or ""
+          bot_acct = read_session_account(bot) or ""
+          print("resolve_len", len(resolve), "sess_len", len(sess_acct), "bot_len", len(bot_acct), flush=True)
+          print("resolve_eq_sess", bool(resolve) and resolve == sess_acct, flush=True)
+          print("resolve_eq_bot", bool(resolve) and resolve == bot_acct, flush=True)
+          print("sess_eq_bot", bool(sess_acct) and sess_acct == bot_acct, flush=True)
+          print("personal_linked", is_account_linked(personal), "bot_linked", is_account_linked(bot), flush=True)
+          locks(personal)
+          locks(bot)
+          if sess_acct:
+              timed_receive("personal", personal, sess_acct, 5)
+          if bot_acct:
+              timed_receive("bot", bot, bot_acct, 5)
           print("PROBE_DONE", flush=True)
           PY
           nohup env PYTHONUNBUFFERED=1 "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli bot-run \
