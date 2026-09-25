@@ -1,0 +1,85 @@
+name: Signal Flow wa-install (Contabo WhatsApp deps)
+
+# Install Node/Chromium + npm ci for app/whatsapp_sidecar. Does NOT wipe Signal sessions.
+# Prefer running after install-signal-flow-app so connector.js is present.
+# Does not start QR (use signal-flow-wa-link). Does not stop ingest-run long-term
+# (install-app may briefly restart ingest separately).
+
+on:
+  workflow_dispatch:
+
+jobs:
+  wa-install:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Install WA Node/Chromium on Contabo
+        env:
+          SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
+          HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
+          ssh -o ConnectTimeout=30 -o ServerAliveInterval=30 -i ~/.ssh/id_ed25519 root@5.189.159.195 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          DATA_ROOT=/opt/signal-flow
+          APP="$DATA_ROOT/app"
+          SIDE="$APP/whatsapp_sidecar"
+          echo "=== precheck ==="
+          echo "app_exists=$([ -d "$APP" ] && echo 1 || echo 0)"
+          echo "connector_exists=$([ -f "$SIDE/connector.js" ] && echo 1 || echo 0)"
+          if [ ! -f "$SIDE/connector.js" ]; then
+            echo "WA_NEED_APP_INSTALL=1"
+            echo "missing connector.js — run install-signal-flow-app first" >&2
+            exit 2
+          fi
+          export DEBIAN_FRONTEND=noninteractive
+          if ! command -v node >/dev/null 2>&1 || ! node -v | grep -qE 'v(2[0-9]|[3-9])'; then
+            echo "=== install Node 20 ==="
+            curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+            apt-get install -y nodejs
+          fi
+          echo "node=$(node -v)"
+          echo "npm=$(npm -v)"
+          # Chromium + deps for Puppeteer
+          if ! command -v chromium-browser >/dev/null 2>&1 && ! command -v chromium >/dev/null 2>&1 && ! command -v google-chrome-stable >/dev/null 2>&1; then
+            echo "=== install Chromium ==="
+            apt-get update -qq
+            apt-get install -y chromium-browser || apt-get install -y chromium || true
+          fi
+          CHROME=""
+          for c in chromium-browser chromium google-chrome-stable google-chrome; do
+            if command -v "$c" >/dev/null 2>&1; then CHROME=$(command -v "$c"); break; fi
+          done
+          echo "chrome_path=${CHROME:-missing}"
+          if [ -z "$CHROME" ]; then
+            echo "WA_CHROME_MISSING=1" >&2
+            exit 3
+          fi
+          # fonts / libs often needed headless
+          apt-get install -y -qq fonts-liberation ca-certificates libnss3 libatk-bridge2.0-0 libgtk-3-0 libgbm1 libasound2t64 2>/dev/null \
+            || apt-get install -y -qq fonts-liberation ca-certificates libnss3 libatk-bridge2.0-0 libgtk-3-0 libgbm1 libasound2 || true
+          echo "=== npm ci ==="
+          cd "$SIDE"
+          if [ -f package-lock.json ]; then
+            npm ci --omit=dev
+          else
+            npm install --omit=dev
+          fi
+          echo "node_modules_ok=$([ -d node_modules/whatsapp-web.js ] && echo 1 || echo 0)"
+          # persist chrome hint for sidecar
+          mkdir -p "$DATA_ROOT/config"
+          printf '%s\n' "$CHROME" > "$DATA_ROOT/config/wa_chrome_path"
+          # Confirm ingest still up
+          PIDFILE=/tmp/sf-ingest-run.pid
+          if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+            echo "INGEST_RUN=alive pid=$(cat "$PIDFILE")"
+          else
+            echo "INGEST_RUN=not_running"
+          fi
+          echo "WA_INSTALL_OK=1"
+          REMOTE
+          shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519
