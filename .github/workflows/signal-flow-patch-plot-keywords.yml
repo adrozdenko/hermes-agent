@@ -39,6 +39,7 @@ jobs:
               "71 опБпС",
               "3 бБпС",
               "4 опБпС",
+              "Шторм",
           ]
 
           root = Path("/opt/signal-flow")
@@ -49,7 +50,7 @@ jobs:
           flow["filters"]["units"] = list(UNITS)
           flow["filters"]["units_exclude"] = ["31 мсп", "67 мсд"]
           # Clear legacy substring keywords so OpsPower unit gate owns matching
-          flow["filters"]["keywords"] = ["Шторм"]  # bare name; units detector covers numbered
+          flow["filters"]["keywords"] = []
           flow["filters"]["keywords_exclude"] = []
           # keep channels_include / sources as already seeded
           if not flow.get("name"):
