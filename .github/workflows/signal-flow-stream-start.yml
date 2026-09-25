@@ -11,7 +11,7 @@ on:
 jobs:
   start:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
       - name: stream-start on Contabo
         env:
@@ -24,7 +24,6 @@ jobs:
           printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
-          # Pass group ref via env to remote (no secrets in group names)
           ssh -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 root@5.189.159.195 \
             "GROUP_REF=$(printf %q "$GROUP_REF") bash -s" <<'REMOTE'
           set -euo pipefail
@@ -38,15 +37,19 @@ jobs:
           pkill -f 'sf-admin.*ingest-run' 2>/dev/null || true
           pkill -f 'signal-cli' 2>/dev/null || true
           sleep 2
-          ACC=$(python3 -c "import json;print(json.load(open('$DATA_ROOT/config/bot.json')).get('signal_account') or '')" 2>/dev/null || true)
-          if [ -n "${ACC:-}" ]; then
-            SC=$(command -v signal-cli || echo /usr/local/bin/signal-cli)
-            echo "=== bot-signal receive sync ==="
-            timeout 45 "$SC" -a "$ACC" --config "$DATA_ROOT/bot-signal" receive -t 12 >/tmp/sf-bot-sync.log 2>&1 || true
+          ACC=$(python3 -c "import json;print(json.load(open('/opt/signal-flow/config/bot.json')).get('signal_account') or '')")
+          SC=$(command -v signal-cli || true)
+          if [ -n "${ACC:-}" ] && [ -n "${SC:-}" ]; then
+            echo "=== bot-signal receive sync (30s) ==="
+            set +e
+            timeout 70 "$SC" -a "$ACC" --config "$DATA_ROOT/bot-signal" receive -t 30 >/tmp/sf-recv.log 2>&1
+            echo "RECV_RC=$?"
+            set -e
             pkill -f 'signal-cli' 2>/dev/null || true
             sleep 1
-            echo SYNC=done
           fi
+          echo "=== list-bot-groups ==="
+          "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli list-bot-groups || true
           echo "=== stream-start ==="
           "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli stream-start "$GROUP_REF"
           echo "=== stream-status ==="
