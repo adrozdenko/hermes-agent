@@ -1,0 +1,114 @@
+name: Signal Flow verify fire-control admit (Contabo)
+
+# Read-only scrubbed stub: match_flow + classify → arta; ingest pin; stream sinks.
+on:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Verify fire-control admit on Contabo
+        env:
+          SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
+          HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
+          ssh -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 root@5.189.159.195 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          DATA_ROOT=/opt/signal-flow
+          APP="$DATA_ROOT/app"
+          echo "=== app sha hint ==="
+          head -n 5 "$APP/sf/topics.py" | sed -n '1,5p' || true
+          grep -n 'has_fire_control\|вогонь-керування' "$APP/sf/topics.py" "$APP/sf/flow_match.py" | head -20
+          echo "=== processes ==="
+          if [ -f /tmp/sf-ingest-run.pid ] && kill -0 "$(cat /tmp/sf-ingest-run.pid)" 2>/dev/null; then
+            echo INGEST_RUN=alive pid=$(cat /tmp/sf-ingest-run.pid)
+          else
+            echo INGEST_RUN=not_running
+            exit 1
+          fi
+          if [ -f /tmp/sf-bot-run.pid ] && kill -0 "$(cat /tmp/sf-bot-run.pid)" 2>/dev/null; then
+            echo BOT_RUN=alive
+            exit 1
+          else
+            echo BOT_RUN=stopped
+          fi
+          echo "=== stream-status ==="
+          "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli stream-status || true
+          echo "=== scrubbed stub match + classify ==="
+          export PYTHONUNBUFFERED=1
+          "$APP/.venv/bin/python" -u - <<'PY'
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, "/opt/signal-flow/app")
+          from sf.flow_match import match_flow
+          from sf.flows import load_default_flow
+          from sf.ingest import resolve_ingest_user
+          from sf.topics import classify_stream_targets, has_fire_control
+          from sf.units import extract_units
+
+          root = Path("/opt/signal-flow")
+          signal_id, _ = resolve_ingest_user(root, "self")
+          flow = load_default_flow(root, signal_id)
+          assert callable(has_fire_control), "has_fire_control missing"
+
+          # Scrubbed paraphrase — unknown unit, sight ∩ fire
+          text = (
+              "укх р/м нв невідома частина — прицел готовий, "
+              "огонь по орієнтиру (scrubbed stub)"
+          )
+          sources = list(flow.get("sources") or [])
+          # Pick a subscribed source_key if present, else chat:self for stub
+          sk = sources[0] if sources else "chat:self"
+          # Ensure channels_include allows this key for the stub
+          filters = dict(flow.get("filters") or {})
+          units = list(filters.get("units") or [])
+          ch_inc = list(filters.get("channels_include") or [])
+          stub_flow = {
+              **flow,
+              "enabled": True,
+              "sources": [sk],
+              "filters": {
+                  **filters,
+                  "units": units or ["254 мсп"],
+                  "channels_include": [sk] if not ch_inc or sk not in ch_inc else ch_inc,
+              },
+          }
+          # Force channel gate to sk
+          stub_flow["filters"]["channels_include"] = [sk]
+          stub_flow["sources"] = [sk]
+
+          msg = {"source_key": sk, "text": text, "id": "stub-fc", "timestamp": 1}
+          ok, reasons = match_flow(stub_flow, msg)
+          targets = classify_stream_targets(text, units=extract_units(text))
+          print("match_ok=", ok, flush=True)
+          print("reasons=", reasons, flush=True)
+          print("targets=", sorted(targets), flush=True)
+          print("has_fc=", has_fire_control(text), flush=True)
+
+          # Half-signals must drop
+          half_sight = {"source_key": sk, "text": "нв невідома — тільки прицел", "id": "h1", "timestamp": 1}
+          half_fire = {"source_key": sk, "text": "нв невідома — тільки огонь", "id": "h2", "timestamp": 1}
+          ok_s, _ = match_flow(stub_flow, half_sight)
+          ok_f, _ = match_flow(stub_flow, half_fire)
+          print("half_sight_drop=", (not ok_s), flush=True)
+          print("half_fire_drop=", (not ok_f), flush=True)
+
+          # 856 сап unchanged
+          sap = "856 сап 144 мсд 20 ЗА — позиції"
+          print("sap_targets=", sorted(classify_stream_targets(sap, units=extract_units(sap))), flush=True)
+
+          assert ok, f"match_flow False reasons={reasons}"
+          assert any("вогонь-керування" in r for r in reasons), reasons
+          assert targets == frozenset({"arta"}), targets
+          assert not ok_s and not ok_f
+          print("VERIFY_OK", flush=True)
+          PY
+          REMOTE
+          shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519
