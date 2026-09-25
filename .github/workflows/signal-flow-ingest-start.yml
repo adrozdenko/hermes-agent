@@ -1,0 +1,54 @@
+name: Signal Flow ingest-start (Contabo)
+
+# Start continuous ingest-run (personal → default flow). Pauses bot-run (bot-signal lock).
+on:
+  workflow_dispatch:
+
+jobs:
+  start:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Start ingest-run on Contabo
+        env:
+          SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
+          HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
+          ssh -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 root@5.189.159.195 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          DATA_ROOT=/opt/signal-flow
+          APP="$DATA_ROOT/app"
+          PIDFILE=/tmp/sf-ingest-run.pid
+          BOTPID=/tmp/sf-bot-run.pid
+          LOG=/tmp/sf-ingest-run.log
+          # Stop prior ingest-run + bot-run (bot-signal needed for DM send)
+          for f in "$PIDFILE" "$BOTPID"; do
+            if [ -f "$f" ]; then
+              OLD=$(cat "$f" 2>/dev/null || true)
+              [ -n "${OLD:-}" ] && kill -0 "$OLD" 2>/dev/null && kill "$OLD" 2>/dev/null || true
+            fi
+          done
+          pkill -f 'sf-admin.*ingest-run' 2>/dev/null || true
+          pkill -f 'sf-admin.*bot-run' 2>/dev/null || true
+          pkill -f 'signal-cli' 2>/dev/null || true
+          sleep 2
+          nohup env PYTHONUNBUFFERED=1 "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli \
+            ingest-run self --receive-timeout 8 --idle-sleep 1 \
+            >"$LOG" 2>&1 &
+          echo $! >"$PIDFILE"
+          sleep 2
+          if kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+            echo INGEST_RUN=alive pid=$(cat "$PIDFILE")
+          else
+            echo INGEST_RUN=dead
+            sed -E 's/\+?[0-9]{8,15}/[redacted]/g; /sgnl:\/\//d' "$LOG" | tail -n 30 || true
+            exit 1
+          fi
+          sed -E 's/\+?[0-9]{8,15}/[redacted]/g; /sgnl:\/\//d' "$LOG" | tail -n 15 || true
+          REMOTE
+          shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519
