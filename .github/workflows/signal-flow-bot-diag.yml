@@ -6,7 +6,7 @@ on:
 jobs:
   diag:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 5
     steps:
       - name: Diagnose bot-run
         env:
@@ -33,40 +33,96 @@ jobs:
           fi
           echo "=== bot-link-status ==="
           "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli bot-link-status || true
-          echo "=== bot.json signal_account key present? ==="
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
-          p=Path("/opt/signal-flow/config/bot.json")
-          d=json.loads(p.read_text()) if p.is_file() else {}
-          sa=d.get("signal_account")
-          print("signal_account_set=", bool(sa and str(sa).strip() and "PLACEHOLDER" not in str(sa).upper()))
-          print("keys=", sorted(d.keys()))
-          PY
-          echo "=== account dir markers (no secrets) ==="
-          ls -la /opt/signal-flow/bot-signal/ 2>/dev/null | head -20
-          # List data filenames only, not contents
-          find /opt/signal-flow/bot-signal/data -maxdepth 2 -type f -printf '%f\n' 2>/dev/null | head -30 || true
-          echo "=== sf-bot-run.log (redacted phones, strip sgnl) ==="
+          echo "=== sf-bot-run.log tail ==="
           if [ -f "$LOG" ]; then
-            sed -E 's/\+?[0-9]{8,15}/[redacted]/g; /sgnl:\/\//d' "$LOG" | tail -n 80
+            sed -E 's/\+?[0-9]{8,15}/[redacted]/g; /sgnl:\/\//d' "$LOG" | tail -n 40
           else
             echo "no log"
           fi
-          echo "=== one-shot receive dry (5s) stderr only summary ==="
-          # Try to see if signal-cli receive errors; do not dump message bodies
-          ACCOUNT_HINT=$("$APP/.venv/bin/python" - <<'PY'
+          echo "=== probe: stop bot briefly, one receive 8s, count shapes (no bodies) ==="
+          if [ -f "$PIDFILE" ]; then
+            OLD=$(cat "$PIDFILE" 2>/dev/null || true)
+            if [ -n "${OLD:-}" ] && kill -0 "$OLD" 2>/dev/null; then
+              kill "$OLD" 2>/dev/null || true
+              sleep 1
+            fi
+          fi
+          pkill -f 'sf-admin.*bot-run' 2>/dev/null || true
+          sleep 1
+          "$APP/.venv/bin/python" - <<'PY'
+          import json, subprocess, sys
           from pathlib import Path
-          import sys
-          sys.path.insert(0,"/opt/signal-flow/app")
-          try:
-            from sf.register import resolve_signal_account
-            print(resolve_signal_account(Path("/opt/signal-flow")) or "")
-          except Exception as e:
-            print("ERR:"+type(e).__name__)
-          PY
+          sys.path.insert(0, "/opt/signal-flow/app")
+          from sf.register import resolve_signal_account
+          from sf.bot_link import signal_cli_bin
+          from sf.paths import bot_signal_dir
+          root = Path("/opt/signal-flow")
+          account = resolve_signal_account(root)
+          bin_path = signal_cli_bin()
+          cfg = str(bot_signal_dir(root))
+          print("account_resolved=", bool(account))
+          print("cli=", bool(bin_path))
+          if not account or not bin_path:
+              raise SystemExit(0)
+          proc = subprocess.run(
+              [bin_path, "--config", cfg, "-a", account, "receive", "--json", "-t", "8"],
+              capture_output=True, text=True, timeout=30,
           )
-          echo "resolve_account_ok=$([ -n \"$ACCOUNT_HINT\" ] && [ \"${ACCOUNT_HINT#ERR:}\" = \"$ACCOUNT_HINT\" ] && echo yes || echo no)"
-          echo "resolve_prefix=$(printf '%s' "$ACCOUNT_HINT" | head -c 4)"
+          # never print stdout bodies — only shape counts + stderr scrubbed
+          n_lines = 0
+          shapes = {"dataMessage": 0, "syncMessage": 0, "syncSent": 0, "other": 0, "parse_fail": 0}
+          for line in (proc.stdout or "").splitlines():
+              line = line.strip()
+              if not line:
+                  continue
+              n_lines += 1
+              try:
+                  payload = json.loads(line)
+              except json.JSONDecodeError:
+                  shapes["parse_fail"] += 1
+                  continue
+              envs = []
+              if isinstance(payload, dict):
+                  if "envelope" in payload:
+                      envs.append(payload.get("envelope") or {})
+                  for row in payload.get("results") or []:
+                      if isinstance(row, dict) and "envelope" in row:
+                          envs.append(row.get("envelope") or {})
+              for env in envs:
+                  if not isinstance(env, dict):
+                      shapes["other"] += 1
+                      continue
+                  if env.get("dataMessage"):
+                      shapes["dataMessage"] += 1
+                  elif (env.get("syncMessage") or {}).get("sentMessage") if isinstance(env.get("syncMessage"), dict) else None:
+                      shapes["syncSent"] += 1
+                      shapes["syncMessage"] += 1
+                  elif env.get("syncMessage"):
+                      shapes["syncMessage"] += 1
+                  else:
+                      shapes["other"] += 1
+          print("receive_exit=", proc.returncode)
+          print("json_lines=", n_lines)
+          print("shapes=", shapes)
+          err = (proc.stderr or "").strip()
+          if err:
+              import re
+              err = re.sub(r"\+[1-9]\d{6,14}", "[redacted]", err)
+              print("stderr_tail=", err[-400:])
+          PY
+          echo "=== restart bot-run ==="
+          export PYTHONUNBUFFERED=1
+          nohup env PYTHONUNBUFFERED=1 "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli bot-run \
+            >"$LOG" 2>&1 &
+          echo $! > "$PIDFILE"
+          sleep 2
+          if kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+            echo "BOT_RUN=restarted pid=$(cat "$PIDFILE")"
+            tail -n 5 "$LOG" || true
+          else
+            echo "BOT_RUN=restart_failed"
+            tail -n 30 "$LOG" || true
+            exit 1
+          fi
           REMOTE
           shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519
