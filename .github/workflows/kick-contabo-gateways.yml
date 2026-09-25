@@ -44,24 +44,46 @@ jobs:
           ' 2>&1 || true
 
           echo "================ RESTART gateways ================"
+          # s6-svc -r succeeds even when the service is already down, so -u never
+          # ran and alfred stayed permanently down. Bring down services up first.
           docker exec hermes sh -c '
             PATH="/command:/package/admin/s6/command:$PATH"
             for s in gateway-default gateway-alfred; do
-              if [ -d /run/service/$s ]; then
+              if [ ! -d /run/service/$s ]; then
+                echo "missing /run/service/$s"
+                continue
+              fi
+              st=$(s6-svstat /run/service/$s 2>&1 || true)
+              echo "-- $s before: $st"
+              # clear sticky down want if present
+              rm -f /run/service/$s/down /run/service/$s/supervise/down 2>/dev/null || true
+              if echo "$st" | grep -q "^up "; then
                 echo "s6-svc -r $s"
-                s6-svc -r /run/service/$s || s6-svc -u /run/service/$s || true
+                s6-svc -r /run/service/$s || true
+              else
+                echo "s6-svc -u $s (was down)"
+                s6-svc -u /run/service/$s || true
               fi
             done
           ' 2>&1 || true
 
-          sleep 8
+          sleep 10
 
           echo "================ gateway s6 after ================"
           docker exec hermes sh -c '
             PATH="/command:/package/admin/s6/command:$PATH"
             for s in gateway-default gateway-alfred; do
               echo "-- $s --"
-              s6-svstat /run/service/$s 2>&1 || echo "(missing)"
+              st=$(s6-svstat /run/service/$s 2>&1 || echo "(missing)")
+              echo "$st"
+              if ! echo "$st" | grep -q "^up "; then
+                echo "!! still down — dump run/finish + state"
+                ls -la /run/service/$s /var/run/s6/services/$s 2>/dev/null || true
+                sed -n "1,80p" /run/service/$s/run 2>/dev/null || true
+                sed -n "1,40p" /run/service/$s/finish 2>/dev/null || true
+                cat /opt/data/gateway_state.json 2>/dev/null || true
+                cat /opt/data/profiles/alfred/gateway_state.json 2>/dev/null || true
+              fi
             done
             ps -eo pid,args 2>/dev/null | grep -E "hermes.*gateway|claude_proxy" | grep -v grep || true
           ' 2>&1 || true

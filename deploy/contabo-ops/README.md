@@ -52,7 +52,7 @@ Volume `/opt/hermes/data` was **not** wiped.
 |---|---|
 | Diagnose Contabo (read-only) | Containers, proxy health, s6 services — no mutate |
 | Recover Contabo (restart loop) | Quarantine tombstone + recreate gateway CMD sleep infinity |
-| Kick Contabo Telegram gateways | Restart s6 gateways; stop flapping dashboard |
+| Kick Contabo Telegram gateways | Restart s6 gateways (`-u` if down — `-r` alone leaves alfred dead); stop flapping dashboard |
 | Fix Contabo Telegram allowlist | Restore owner `allow_from` / env |
 | Probe Contabo Telegram auth | Allowlist + pairing + recent connect/block lines |
 | Install Contabo compose overlay | scp CMD overlay to host without image rebuild |
