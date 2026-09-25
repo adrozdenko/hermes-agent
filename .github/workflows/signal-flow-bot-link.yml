@@ -38,16 +38,7 @@ jobs:
 
           if [ "${CLEAR_SESSION:-false}" = "true" ]; then
             echo "clear_session=true — wiping Contabo bot-signal/data (SMS leftovers)"
-            ssh -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 root@5.189.159.195 'bash -s' <<'WIPE'
-            set -euo pipefail
-            ACCOUNT=/opt/signal-flow/bot-signal
-            test -d "$ACCOUNT" || { echo "bot-signal missing" >&2; exit 1; }
-            rm -rf "$ACCOUNT/data"
-            rm -f "$ACCOUNT/.bot-link.pid"
-            mkdir -p "$ACCOUNT/data"
-            chmod 700 "$ACCOUNT" "$ACCOUNT/data"
-            echo "session cleared (data/ empty)"
-            WIPE
+            ssh -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 root@5.189.159.195               'set -euo pipefail; ACCOUNT=/opt/signal-flow/bot-signal; test -d "$ACCOUNT"; rm -rf "$ACCOUNT/data"; rm -f "$ACCOUNT/.bot-link.pid"; mkdir -p "$ACCOUNT/data"; chmod 700 "$ACCOUNT" "$ACCOUNT/data"; echo session_cleared'
           fi
 
           ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=40 \
