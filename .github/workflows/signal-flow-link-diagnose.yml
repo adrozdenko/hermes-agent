@@ -124,7 +124,8 @@ jobs:
           print(
               "dm_done_s=", round(time.monotonic() - t0, 2),
               "dm_took_s=", round(time.monotonic() - t_send, 2),
-              "dm_ok=", sent.ok, "dm_stub=", sent.stub,
+              "dm_ok=", getattr(sent, "ok", None),
+              "dm_stub=", getattr(sent, "stub", None),
               "alive_after_dm=", proc.poll() is None,
               flush=True,
           )
