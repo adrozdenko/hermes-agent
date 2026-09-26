@@ -1,0 +1,197 @@
+name: Signal Flow disk cleanup (Contabo)
+
+# Safe: remove orphan /tmp/libsignal* extracts + journal vacuum leftovers.
+# Never deletes sessions, channels, QR, or SSH keys. Optional ingest restart.
+
+on:
+  workflow_dispatch:
+    inputs:
+      restart_ingests:
+        description: "After cleanup, restart SIGNAL ingest + WA ingest"
+        type: boolean
+        default: true
+      also_vacuum_journal:
+        description: "journalctl --vacuum-size=200M"
+        type: boolean
+        default: true
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Free disk + optional restart
+        env:
+          SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
+          HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
+          RESTART: ${{ inputs.restart_ingests }}
+          VACUUM: ${{ inputs.also_vacuum_journal }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
+          ssh -o ConnectTimeout=30 -o ServerAliveInterval=20 \
+              -i ~/.ssh/id_ed25519 root@5.189.159.195 \
+              "RESTART=$(printf %q "${RESTART:-true}") VACUUM=$(printf %q "${VACUUM:-true}") bash -s" <<'REMOTE'
+          set -euo pipefail
+          SCRUB() { sed -E 's/\+?[0-9]{8,15}/[tel]/g; /sgnl:\/\//d'; }
+          echo "CLEANUP_BEGIN"
+          echo "=== df before ==="
+          df -h / /tmp | head -5
+          echo "=== /tmp libsignal orphans ==="
+          ls -ld /tmp/libsignal* 2>/dev/null | wc -l | awk '{print "libsignal_dirs="$1}'
+          du -sh /tmp/libsignal* 2>/dev/null | awk '{s+=$1} END{print "note=see_du_lines"}' || true
+          du -ch /tmp/libsignal* 2>/dev/null | tail -1 || true
+          # Only remove clearly-named signal-cli native extract dirs
+          REMOVED=0
+          for d in /tmp/libsignal*; do
+            [ -e "$d" ] || continue
+            case "$d" in
+              /tmp/libsignal*) rm -rf "$d"; REMOVED=$((REMOVED+1)) ;;
+            esac
+          done
+          echo "libsignal_removed=$REMOVED"
+          # Other safe tmp clutter from our Contabo Actions
+          rm -f /tmp/signal-flow.tgz /tmp/sf-recv.log 2>/dev/null || true
+          # Puppeteer/chromium crashpads in /tmp (safe)
+          find /tmp -maxdepth 1 -type d \( -name '.org.chromium.Chromium.*' -o -name 'puppeteer_dev_chrome_profile*' -o -name 'chrome_crashpad*' \) -prune -exec rm -rf {} + 2>/dev/null || true
+          if [ "${VACUUM:-true}" = "true" ]; then
+            echo "=== journal vacuum ==="
+            journalctl --vacuum-size=200M 2>&1 | tail -5 || true
+          fi
+          echo "=== big top-level dirs (scrubbed names) ==="
+          du -xh --max-depth=1 / 2>/dev/null | sort -hr | head -15 | SCRUB || true
+          du -xh --max-depth=1 /var 2>/dev/null | sort -hr | head -10 | SCRUB || true
+          du -xh --max-depth=1 /opt 2>/dev/null | sort -hr | head -10 | SCRUB || true
+          du -xh --max-depth=1 /tmp 2>/dev/null | sort -hr | head -15 | SCRUB || true
+          echo "=== df after cleanup ==="
+          df -h / /tmp | head -5
+          AVAIL_K=$(df -Pk / | awk 'NR==2{print $4}')
+          echo "avail_kb=$AVAIL_K"
+          if [ "${AVAIL_K:-0}" -lt 500000 ]; then
+            echo "WARN: still under 500MB free — inspect docker/images/logs next"
+          fi
+
+          if [ "${RESTART:-true}" != "true" ]; then
+            echo "RESTART_SKIPPED=1"
+            echo "CLEANUP_END"
+            exit 0
+          fi
+
+          DATA_ROOT=/opt/signal-flow
+          APP="$DATA_ROOT/app"
+          SF="$APP/.venv/bin/sf-admin"
+          PIDFILE=/tmp/sf-ingest-run.pid
+          LOG=/tmp/sf-ingest-run.log
+          WAPID=/tmp/sf-wa-ingest.pid
+          WALOG=/tmp/sf-wa-ingest.log
+          BOTPID=/tmp/sf-bot-run.pid
+
+          echo "=== restart SIGNAL ingest ==="
+          if [ -f "$PIDFILE" ]; then
+            OLD=$(cat "$PIDFILE" 2>/dev/null || true)
+            [ -n "${OLD:-}" ] && kill -0 "$OLD" 2>/dev/null && kill "$OLD" 2>/dev/null || true
+          fi
+          pkill -f 'sf-admin.* ingest-run' 2>/dev/null || true
+          pkill -f 'sf-admin.*bot-run' 2>/dev/null || true
+          # do NOT broad-pkill all signal-cli forever; ingest-start pattern:
+          pkill -f 'signal-cli' 2>/dev/null || true
+          sleep 2
+          : >"$LOG"
+          nohup env PYTHONUNBUFFERED=1 "$SF" --data-root "$DATA_ROOT" --force-admin-cli \
+            ingest-run self --receive-timeout 8 --idle-sleep 1 \
+            >"$LOG" 2>&1 &
+          echo $! >"$PIDFILE"
+          sleep 3
+          if kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+            echo "SIGNAL_INGEST=alive pid=$(cat "$PIDFILE")"
+          else
+            echo "SIGNAL_INGEST=dead"
+            SCRUB <"$LOG" | tail -30 || true
+          fi
+          # Brief receive-health sample (scrubbed)
+          sleep 10
+          if grep -q 'receive failed' "$LOG" 2>/dev/null; then
+            echo "SIGNAL_RECEIVE=still_failing"
+            grep -E 'receive failed|Native\.|ENOSPC|No space' "$LOG" | SCRUB | tail -15 || true
+          else
+            echo "SIGNAL_RECEIVE=no_fail_in_log_yet"
+            SCRUB <"$LOG" | tail -10 || true
+          fi
+
+          echo "=== restart WA ingest ==="
+          LINKPID=/tmp/sf-wa-sidecar.pid
+          HTTPPID=/tmp/sf-wa-qr-http.pid
+          if [ -f "$WAPID" ]; then
+            OLD=$(cat "$WAPID" 2>/dev/null || true)
+            [ -n "${OLD:-}" ] && kill -0 "$OLD" 2>/dev/null && kill "$OLD" 2>/dev/null || true
+            rm -f "$WAPID"
+          fi
+          pkill -f 'sf-admin.*wa-ingest-run' 2>/dev/null || true
+          if [ -f "$LINKPID" ]; then
+            OLD=$(cat "$LINKPID" 2>/dev/null || true)
+            [ -n "${OLD:-}" ] && kill -0 "$OLD" 2>/dev/null && kill "$OLD" 2>/dev/null || true
+            rm -f "$LINKPID"
+          fi
+          if [ -f "$HTTPPID" ]; then
+            OLD=$(cat "$HTTPPID" 2>/dev/null || true)
+            [ -n "${OLD:-}" ] && kill -0 "$OLD" 2>/dev/null && kill "$OLD" 2>/dev/null || true
+            rm -f "$HTTPPID"
+          fi
+          pkill -f 'whatsapp_sidecar/connector.js' 2>/dev/null || true
+          sleep 2
+          if [ ! -d "$APP/whatsapp_sidecar/node_modules/whatsapp-web.js" ]; then
+            echo "WA_NODE_MODULES_MISSING=1"
+            cd "$APP/whatsapp_sidecar"
+            if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi
+            cd /
+          fi
+          : >"$WALOG"
+          nohup env PYTHONUNBUFFERED=1 "$SF" --data-root "$DATA_ROOT" --force-admin-cli \
+            wa-ingest-run self --receive-timeout 2 --idle-sleep 0.5 \
+            >"$WALOG" 2>&1 &
+          echo $! >"$WAPID"
+          READY=0
+          for i in $(seq 1 90); do
+            if ! kill -0 "$(cat "$WAPID")" 2>/dev/null; then
+              echo "WA_INGEST=dead during ready wait"
+              SCRUB <"$WALOG" | tail -40 || true
+              break
+            fi
+            if grep -qE 'event=sidecar_(ready|authenticated)' "$WALOG" 2>/dev/null \
+               || grep -qE '"type":"(ready|authenticated)"' "$WALOG" 2>/dev/null; then
+              READY=1
+              break
+            fi
+            if grep -qE 'event=sidecar_qr|потребує QR|event=sidecar_incompatible|немає node_modules|Chromium/Chrome не знайдено' "$WALOG" 2>/dev/null; then
+              echo "WA_INGEST=hard_fail"
+              SCRUB <"$WALOG" | tail -40 || true
+              break
+            fi
+            sleep 1
+          done
+          if [ "$READY" = 1 ]; then
+            echo "WA_INGEST=alive pid=$(cat "$WAPID") ready=1"
+          elif kill -0 "$(cat "$WAPID")" 2>/dev/null; then
+            echo "WA_INGEST=alive_but_ready_unconfirmed pid=$(cat "$WAPID")"
+            SCRUB <"$WALOG" | tail -20 || true
+          else
+            echo "WA_INGEST=dead"
+          fi
+
+          if [ -f "$BOTPID" ] && kill -0 "$(cat "$BOTPID")" 2>/dev/null; then
+            echo "BOT_RUN=alive (unexpected)"
+          else
+            echo "BOT_RUN=stopped"
+          fi
+          if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+            echo "SIGNAL_INGEST_FINAL=alive pid=$(cat "$PIDFILE")"
+          else
+            echo "SIGNAL_INGEST_FINAL=dead"
+          fi
+          df -h / | head -2
+          echo "CLEANUP_END"
+          REMOTE
+          shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519
