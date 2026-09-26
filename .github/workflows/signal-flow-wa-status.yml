@@ -96,6 +96,38 @@ jobs:
           else
             echo "no sf-wa-link.log"
           fi
+          # HONEST_WA: process alone ≠ alive; require ready/authenticated or bonded LocalAuth
+          echo "=== WA_INGEST health ==="
+          WAPID=/tmp/sf-wa-ingest.pid
+          WALOG=/tmp/sf-wa-ingest.log
+          WA_ALIVE=0
+          if systemctl is-active --quiet signal-flow-wa-ingest.service 2>/dev/null; then
+            WA_ALIVE=1
+            echo "wa_unit=active"
+          elif [ -f "$WAPID" ] && kill -0 "$(cat "$WAPID")" 2>/dev/null; then
+            WA_ALIVE=1
+            echo "wa_unit=pidfile"
+          else
+            echo "wa_unit=inactive"
+          fi
+          WA_STATE=unknown
+          if [ -f "$WALOG" ]; then
+            if grep -qE 'event=sidecar_(ready|authenticated)|"type":"(ready|authenticated)"' "$WALOG" 2>/dev/null; then
+              WA_STATE=ready
+            elif grep -qE 'event=sidecar_qr|"type":"qr"|потребує QR' "$WALOG" 2>/dev/null; then
+              WA_STATE=qr
+            fi
+          fi
+          # LocalAuth profile hint already computed as AUTH above when session exists
+          if [ "$WA_ALIVE" = 1 ] && [ "$WA_STATE" = "ready" ]; then
+            echo "WA_INGEST=alive"
+          elif [ "$WA_ALIVE" = 1 ]; then
+            echo "WA_INGEST=not_bonded"
+          else
+            echo "WA_INGEST=dead"
+          fi
+          echo "wa_state_guess=$WA_STATE"
+
           echo "=== channels whatsapp count ==="
           if [ -n "${UDIR:-}" ] && [ -f "$UDIR/channels.json" ]; then
             python3 - "$UDIR/channels.json" <<'PY'

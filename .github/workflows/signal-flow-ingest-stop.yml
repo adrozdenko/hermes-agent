@@ -23,6 +23,8 @@ jobs:
           DATA_ROOT=/opt/signal-flow
           APP="$DATA_ROOT/app"
           PIDFILE=/tmp/sf-ingest-run.pid
+          systemctl stop signal-flow-ingest.service 2>/dev/null || true
+          systemctl disable signal-flow-ingest.service 2>/dev/null || true
           if [ -f "$PIDFILE" ]; then
             OLD=$(cat "$PIDFILE" 2>/dev/null || true)
             [ -n "${OLD:-}" ] && kill -0 "$OLD" 2>/dev/null && kill "$OLD" 2>/dev/null || true

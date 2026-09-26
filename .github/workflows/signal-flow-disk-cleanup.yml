@@ -82,6 +82,7 @@ jobs:
           HTTPPID=/tmp/sf-wa-qr-http.pid
 
           echo "=== restart SIGNAL ingest ==="
+          systemctl stop signal-flow-ingest.service 2>/dev/null || true
           if [ -f "$PIDFILE" ]; then
             OLD=$(cat "$PIDFILE" 2>/dev/null || true)
             [ -n "${OLD:-}" ] && kill -0 "$OLD" 2>/dev/null && kill "$OLD" 2>/dev/null || true
@@ -91,11 +92,18 @@ jobs:
           pkill -f 'signal-cli' 2>/dev/null || true
           sleep 2
           : >"$LOG"
-          nohup env PYTHONUNBUFFERED=1 "$SF" --data-root "$DATA_ROOT" --force-admin-cli \
-            ingest-run self --receive-timeout 8 --idle-sleep 1 \
-            >"$LOG" 2>&1 &
-          echo $! >"$PIDFILE"
-          sleep 3
+          if [ -f /etc/systemd/system/signal-flow-ingest.service ]; then
+            systemctl enable signal-flow-ingest.service
+            systemctl start signal-flow-ingest
+            sleep 3
+            echo "$(systemctl show -p MainPID --value signal-flow-ingest.service)" >"$PIDFILE"
+          else
+            nohup env PYTHONUNBUFFERED=1 "$SF" --data-root "$DATA_ROOT" --force-admin-cli \
+              ingest-run self --receive-timeout 8 --idle-sleep 1 \
+              >"$LOG" 2>&1 &
+            echo $! >"$PIDFILE"
+            sleep 3
+          fi
           if kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
             echo "SIGNAL_INGEST=alive pid=$(cat "$PIDFILE")"
           else
@@ -163,7 +171,7 @@ jobs:
           if [ "$READY" = 1 ]; then
             echo "WA_INGEST=alive pid=$(cat "$WAPID") ready=1"
           elif [ -f "$WAPID" ] && kill -0 "$(cat "$WAPID")" 2>/dev/null; then
-            echo "WA_INGEST=alive_but_ready_unconfirmed pid=$(cat "$WAPID")"
+            echo "WA_INGEST=not_bonded"
             SCRUB <"$WALOG" | tail -20 || true
           else
             echo "WA_INGEST=dead"

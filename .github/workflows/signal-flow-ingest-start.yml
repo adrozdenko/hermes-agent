@@ -1,6 +1,7 @@
 name: Signal Flow ingest-start (Contabo)
 
 # Start continuous ingest-run (personal → default flow). Pauses bot-run (bot-signal lock).
+# Prefers systemd unit signal-flow-ingest.service when installed; else nohup fallback.
 on:
   workflow_dispatch:
 
@@ -26,7 +27,12 @@ jobs:
           PIDFILE=/tmp/sf-ingest-run.pid
           BOTPID=/tmp/sf-bot-run.pid
           LOG=/tmp/sf-ingest-run.log
+          UNIT=signal-flow-ingest.service
           # Stop prior ingest-run + bot-run (bot-signal needed for DM send)
+          if systemctl list-unit-files "$UNIT" >/dev/null 2>&1 \
+             && [ -f "/etc/systemd/system/$UNIT" ]; then
+            systemctl stop "$UNIT" 2>/dev/null || true
+          fi
           for f in "$PIDFILE" "$BOTPID"; do
             if [ -f "$f" ]; then
               OLD=$(cat "$f" 2>/dev/null || true)
@@ -37,18 +43,36 @@ jobs:
           pkill -f 'sf-admin.*bot-run' 2>/dev/null || true
           pkill -f 'signal-cli' 2>/dev/null || true
           sleep 2
-          nohup env PYTHONUNBUFFERED=1 "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli \
-            ingest-run self --receive-timeout 8 --idle-sleep 1 \
-            >"$LOG" 2>&1 &
-          echo $! >"$PIDFILE"
-          sleep 2
-          if kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-            echo INGEST_RUN=alive pid=$(cat "$PIDFILE")
+          if [ -f "/etc/systemd/system/$UNIT" ]; then
+            systemctl daemon-reload
+            systemctl enable "$UNIT"
+            systemctl start signal-flow-ingest
+            sleep 2
+            if systemctl is-active --quiet "$UNIT"; then
+              MAINPID=$(systemctl show -p MainPID --value "$UNIT" 2>/dev/null || echo 0)
+              echo "$MAINPID" >"$PIDFILE"
+              echo INGEST_RUN=alive pid=$MAINPID via=systemd
+              echo SIGNAL_INGEST=alive pid=$MAINPID via=systemd
+            else
+              echo INGEST_RUN=dead via=systemd
+              journalctl -u "$UNIT" -n 40 --no-pager 2>/dev/null \
+                | sed -E 's/\+?[0-9]{8,15}/[redacted]/g; /sgnl:\/\//d' || true
+              exit 1
+            fi
           else
-            echo INGEST_RUN=dead
-            sed -E 's/\+?[0-9]{8,15}/[redacted]/g; /sgnl:\/\//d' "$LOG" | tail -n 30 || true
-            exit 1
+            nohup env PYTHONUNBUFFERED=1 "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli \
+              ingest-run self --receive-timeout 8 --idle-sleep 1 \
+              >"$LOG" 2>&1 &
+            echo $! >"$PIDFILE"
+            sleep 2
+            if kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+              echo INGEST_RUN=alive pid=$(cat "$PIDFILE") via=nohup
+            else
+              echo INGEST_RUN=dead
+              sed -E 's/\+?[0-9]{8,15}/[redacted]/g; /sgnl:\/\//d' "$LOG" | tail -n 30 || true
+              exit 1
+            fi
+            sed -E 's/\+?[0-9]{8,15}/[redacted]/g; /sgnl:\/\//d' "$LOG" | tail -n 15 || true
           fi
-          sed -E 's/\+?[0-9]{8,15}/[redacted]/g; /sgnl:\/\//d' "$LOG" | tail -n 15 || true
           REMOTE
           shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519

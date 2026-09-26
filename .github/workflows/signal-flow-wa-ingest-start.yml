@@ -70,6 +70,9 @@ jobs:
           echo "node_modules_ok=$([ -d "$APP/whatsapp_sidecar/node_modules/whatsapp-web.js" ] && echo 1 || echo 0)"
 
           # Stop prior wa-ingest only (NOT Signal ingest)
+          if [ -f /etc/systemd/system/signal-flow-wa-ingest.service ]; then
+            systemctl stop signal-flow-wa-ingest.service 2>/dev/null || true
+          fi
           if [ -f "$PIDFILE" ]; then
             OLD=$(cat "$PIDFILE" 2>/dev/null || true)
             [ -n "${OLD:-}" ] && kill -0 "$OLD" 2>/dev/null && kill "$OLD" 2>/dev/null || true
@@ -96,21 +99,45 @@ jobs:
           sleep 2
 
           # Confirm Signal ingest still the intended live path (do not restart here)
-          if [ -f "$SIGNALPID" ] && kill -0 "$(cat "$SIGNALPID")" 2>/dev/null; then
+          if systemctl is-active --quiet signal-flow-ingest.service 2>/dev/null; then
+            echo "SIGNAL_INGEST=alive pid=$(systemctl show -p MainPID --value signal-flow-ingest.service) via=systemd"
+          elif [ -f "$SIGNALPID" ] && kill -0 "$(cat "$SIGNALPID")" 2>/dev/null; then
             echo "SIGNAL_INGEST=alive pid=$(cat "$SIGNALPID")"
           else
             echo "SIGNAL_INGEST=not_running (unexpected — install/ingest-start may be needed)"
           fi
 
+          UNIT=signal-flow-wa-ingest.service
           : >"$LOG"
-          nohup env PYTHONUNBUFFERED=1 "$SF" --data-root "$DATA_ROOT" --force-admin-cli \
-            wa-ingest-run "${USER_ID:-self}" --receive-timeout 2 --idle-sleep 0.5 \
-            >"$LOG" 2>&1 &
-          echo $! >"$PIDFILE"
+          if [ -f "/etc/systemd/system/$UNIT" ] && [ "${USER_ID:-self}" = "self" ]; then
+            systemctl daemon-reload
+            systemctl enable "$UNIT"
+            systemctl start signal-flow-wa-ingest
+            sleep 2
+            MAINPID=$(systemctl show -p MainPID --value "$UNIT" 2>/dev/null || echo 0)
+            echo "$MAINPID" >"$PIDFILE"
+            # journal may lag; also follow unit stdout if StandardOutput=journal
+            for i in $(seq 1 5); do
+              journalctl -u "$UNIT" -n 80 --no-pager 2>/dev/null >>"$LOG" || true
+              sleep 1
+            done
+          else
+            nohup env PYTHONUNBUFFERED=1 "$SF" --data-root "$DATA_ROOT" --force-admin-cli \
+              wa-ingest-run "${USER_ID:-self}" --receive-timeout 2 --idle-sleep 0.5 \
+              >"$LOG" 2>&1 &
+            echo $! >"$PIDFILE"
+          fi
           # Wait for Chromium LocalAuth ready (or fail fast on qr/error)
           READY=0
           for i in $(seq 1 90); do
-            if ! kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+            ALIVE=0
+            if [ -f "/etc/systemd/system/$UNIT" ] && [ "${USER_ID:-self}" = "self" ]; then
+              systemctl is-active --quiet "$UNIT" && ALIVE=1 || true
+              journalctl -u "$UNIT" -n 20 --no-pager 2>/dev/null >>"$LOG" || true
+            elif [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+              ALIVE=1
+            fi
+            if [ "$ALIVE" != 1 ]; then
               echo "WA_INGEST=dead during ready wait"
               sed -E 's/\+?[0-9]{8,15}/[redacted]/g; s/[0-9]{6,}@(s\.whatsapp\.net|g\.us|lid|newsletter)/[redacted]/gi; /sgnl:\/\//d' "$LOG" | tail -n 40 || true
               exit 1
@@ -121,7 +148,9 @@ jobs:
               break
             fi
             if grep -qE 'event=sidecar_qr|потребує QR|немає node_modules|Chromium/Chrome не знайдено' "$LOG" 2>/dev/null; then
-              echo "WA_INGEST=not_bonded_or_misconfigured"
+              echo "WA_INGEST=not_bonded"
+              # Leave unit enabled but stop looping restart spam if hard-fail exited
+              systemctl stop "$UNIT" 2>/dev/null || true
               sed -E 's/\+?[0-9]{8,15}/[redacted]/g; s/[0-9]{6,}@(s\.whatsapp\.net|g\.us|lid|newsletter)/[redacted]/gi; /sgnl:\/\//d' "$LOG" | tail -n 40 || true
               exit 1
             fi
@@ -130,12 +159,10 @@ jobs:
           if [ "$READY" != 1 ]; then
             echo "WA_INGEST=ready_timeout"
             sed -E 's/\+?[0-9]{8,15}/[redacted]/g; s/[0-9]{6,}@(s\.whatsapp\.net|g\.us|lid|newsletter)/[redacted]/gi; /sgnl:\/\//d' "$LOG" | tail -n 40 || true
-            # still running counts as soft-ok if process alive; surface timeout
-            if kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-              echo "WA_INGEST=alive_but_ready_unconfirmed pid=$(cat "$PIDFILE")"
-            else
-              exit 1
-            fi
+            # Honest: pid without ready/authenticated is NOT alive
+            echo "WA_INGEST=not_bonded"
+            systemctl stop "$UNIT" 2>/dev/null || true
+            exit 1
           else
             echo "WA_INGEST=alive pid=$(cat "$PIDFILE") ready=1"
           fi

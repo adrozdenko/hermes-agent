@@ -22,6 +22,8 @@ jobs:
           ssh -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 root@5.189.159.195 'bash -s' <<'REMOTE'
           set -euo pipefail
           PIDFILE=/tmp/sf-wa-ingest.pid
+          systemctl stop signal-flow-wa-ingest.service 2>/dev/null || true
+          systemctl disable signal-flow-wa-ingest.service 2>/dev/null || true
           LINKPID=/tmp/sf-wa-sidecar.pid
           HTTPPID=/tmp/sf-wa-qr-http.pid
           SIGNALPID=/tmp/sf-ingest-run.pid
