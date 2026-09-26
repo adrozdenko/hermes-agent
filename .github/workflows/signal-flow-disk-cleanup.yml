@@ -61,11 +61,9 @@ jobs:
             echo "=== journal vacuum ==="
             journalctl --vacuum-size=200M 2>&1 | tail -5 || true
           fi
-          echo "=== big top-level dirs (scrubbed names) ==="
-          du -xh --max-depth=1 / 2>/dev/null | sort -hr | head -15 | SCRUB || true
-          du -xh --max-depth=1 /var 2>/dev/null | sort -hr | head -10 | SCRUB || true
-          du -xh --max-depth=1 /opt 2>/dev/null | sort -hr | head -10 | SCRUB || true
-          du -xh --max-depth=1 /tmp 2>/dev/null | sort -hr | head -15 | SCRUB || true
+          echo "=== big dirs (bounded, scrubbed) ==="
+          du -xh --max-depth=1 /var/log /var/lib/docker /opt /tmp /home 2>/dev/null | sort -hr | head -25 | SCRUB || true
+          du -xh --max-depth=1 /opt/signal-flow 2>/dev/null | sort -hr | head -15 | SCRUB || true
           echo "=== df after cleanup ==="
           df -h / /tmp | head -5
           AVAIL_K=$(df -Pk / | awk 'NR==2{print $4}')
