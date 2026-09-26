@@ -1,0 +1,115 @@
+name: Signal Flow wa-select (Contabo)
+
+# Generic Almanac-style select: channels.json whatsapp[] + sources + channels_include.
+# Opaque keys only (no phones/JIDs). Does NOT kill ingest-run.
+# Does NOT mutate Almanac units / units_exclude.
+# Prefer this over wa-select-vuha for new chats; vuha is a thin hardcoded wrapper.
+on:
+  workflow_dispatch:
+    inputs:
+      user_id:
+        description: "Farm user id under users/ (or self). Default self."
+        type: string
+        default: "self"
+      opaque_key:
+        description: "Opaque whatsapp:h_… key (required; no raw JID/phone)"
+        type: string
+        required: true
+      name:
+        description: "Display name for cards / Джерело"
+        type: string
+        required: true
+      kind:
+        description: "Channel kind (group|community|…)"
+        type: string
+        default: "group"
+      alias_keys:
+        description: "CSV of opaque twin keys (whatsapp:h_…) to merge as alias_keys"
+        type: string
+        default: ""
+
+jobs:
+  select:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Select WA channel into ПОТІК
+        env:
+          SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
+          HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
+          USER_ID: ${{ inputs.user_id }}
+          OPAQUE_KEY: ${{ inputs.opaque_key }}
+          WA_NAME: ${{ inputs.name }}
+          WA_KIND: ${{ inputs.kind }}
+          ALIAS_KEYS_IN: ${{ inputs.alias_keys }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
+          ALIAS_CLEAN=$(printf '%s' "${ALIAS_KEYS_IN:-}" | tr ',' '\n' | sed '/^$/d' | grep -E '^whatsapp:h_[0-9a-f]+$' || true)
+          ALIAS_CSV=$(printf '%s' "$ALIAS_CLEAN" | paste -sd, - || true)
+          ssh -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 root@5.189.159.195 \
+            "USER_ID=$(printf '%q' "${USER_ID:-self}") \
+             OPAQUE_KEY=$(printf '%q' "${OPAQUE_KEY}") \
+             WA_NAME=$(printf '%q' "${WA_NAME}") \
+             WA_KIND=$(printf '%q' "${WA_KIND:-group}") \
+             ALIAS_KEYS_IN=$(printf '%q' "$ALIAS_CSV") \
+             bash -s" <<'REMOTE'
+          set -euo pipefail
+          export PYTHONUNBUFFERED=1
+          export SF_USER_ID="${USER_ID:-self}"
+          export SF_OPAQUE_KEY="$OPAQUE_KEY"
+          export SF_WA_NAME="$WA_NAME"
+          export SF_WA_KIND="${WA_KIND:-group}"
+          export SF_ALIAS_KEYS="${ALIAS_KEYS_IN:-}"
+          /opt/signal-flow/app/.venv/bin/python -u - <<'PY'
+          import os, sys
+          from pathlib import Path
+          sys.path.insert(0, "/opt/signal-flow/app")
+          from sf.ingest import resolve_ingest_user
+          from sf.whatsapp_channels import WhatsAppChannelError, select_whatsapp_channel
+
+          root = Path("/opt/signal-flow")
+          signal_id, _ = resolve_ingest_user(root, os.environ.get("SF_USER_ID") or "self")
+          aliases = [
+              p.strip()
+              for p in (os.environ.get("SF_ALIAS_KEYS") or "").split(",")
+              if p.strip().startswith("whatsapp:h_")
+          ]
+          try:
+              result = select_whatsapp_channel(
+                  root,
+                  signal_id,
+                  opaque_key=os.environ["SF_OPAQUE_KEY"],
+                  name=os.environ.get("SF_WA_NAME") or "WhatsApp",
+                  kind=os.environ.get("SF_WA_KIND") or "group",
+                  alias_keys=aliases or None,
+              )
+          except WhatsAppChannelError as exc:
+              print(f"error: {exc}", flush=True)
+              raise SystemExit(1)
+          print(f"wa-select: key={result['key']}", flush=True)
+          print(f"wa-select: name={result['name']!r}", flush=True)
+          print(f"wa-select: kind={result['kind']}", flush=True)
+          print(f"wa-select: alias_keys_n={len(result.get('alias_keys') or [])}", flush=True)
+          print(f"wa-select: sources_n={result['sources_n']}", flush=True)
+          print(f"wa-select: channels_include_n={result['channels_include_n']}", flush=True)
+          print(f"wa-select: units_n={result['units_n']}", flush=True)
+          print("SELECT_OK", flush=True)
+          PY
+          PIDFILE=/tmp/sf-ingest-run.pid
+          if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+            echo INGEST_RUN=alive pid=$(cat "$PIDFILE")
+          else
+            echo INGEST_RUN=not_running
+          fi
+          WA_PID=/tmp/sf-wa-ingest.pid
+          if [ -f "$WA_PID" ] && kill -0 "$(cat "$WA_PID")" 2>/dev/null; then
+            echo WA_INGEST=alive pid=$(cat "$WA_PID")
+          else
+            echo WA_INGEST=not_running
+          fi
+          REMOTE
+          shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519
