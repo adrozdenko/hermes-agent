@@ -1,0 +1,84 @@
+name: Signal Flow dual-ingest host diag (Contabo)
+
+# Read-only: disk/tmp/OOM + scrubbed tails of ingest / wa-ingest / wa-link logs.
+# No pkill. Never phones/JIDs/sgnl://SSH keys.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Host + scrubbed dual-ingest logs
+        env:
+          SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
+          HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
+          ssh -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 root@5.189.159.195 'bash -s' <<'REMOTE'
+          set +e
+          SCRUB() { sed -E 's/\+?[0-9]{8,15}/[tel]/g; s/[0-9]{6,}@(s\.whatsapp\.net|g\.us|lid|newsletter)/[jid]/gi; /sgnl:\/\//d; s/[A-Za-z0-9+\/]{40,}={0,2}/[b64]/g'; }
+          echo "DIAG_DUAL_BEGIN"
+          echo "=== host ==="
+          date -u +"utc=%Y-%m-%dT%H:%M:%SZ"
+          uptime
+          echo -n "boot_id="; cat /proc/sys/kernel/random/boot_id 2>/dev/null; echo
+          who -b 2>/dev/null || true
+          echo "=== df ==="
+          df -h / /tmp /opt /var /opt/signal-flow 2>/dev/null | head -20
+          echo "=== df inodes ==="
+          df -ih / /tmp /opt 2>/dev/null | head -10
+          echo "=== tmp mount ==="
+          findmnt /tmp 2>/dev/null || mount | grep -E ' /tmp ' || true
+          echo "=== tmp usage top ==="
+          du -sh /tmp/* 2>/dev/null | sort -hr | head -15 | SCRUB
+          echo "=== memory ==="
+          free -h
+          echo "=== oom / kill hints (dmesg) ==="
+          dmesg -T 2>/dev/null | rg -i 'oom|Out of memory|Killed process|signal-cli|chromium|chrome|node' | tail -40 | SCRUB
+          journalctl -k --since "12 hours ago" 2>/dev/null | rg -i 'oom|Out of memory|Killed process' | tail -20 | SCRUB
+          echo "=== pids ==="
+          for f in /tmp/sf-ingest-run.pid /tmp/sf-wa-ingest.pid /tmp/sf-wa-sidecar.pid /tmp/sf-bot-run.pid; do
+            if [ -f "$f" ]; then
+              p=$(cat "$f" 2>/dev/null)
+              if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+                echo "$f=alive pid=$p"
+                ps -o pid,etime,rss,cmd -p "$p" 2>/dev/null | SCRUB | head -3
+              else
+                echo "$f=dead_or_stale"
+              fi
+            else
+              echo "$f=missing"
+            fi
+          done
+          echo "pgrep_ingest:"; pgrep -af 'sf-admin.*(ingest-run|wa-ingest-run|bot-run)' 2>/dev/null | SCRUB | head -10
+          echo "pgrep_signal_cli:"; pgrep -af 'signal-cli' 2>/dev/null | SCRUB | head -10
+          echo "pgrep_chrome_wa:"; pgrep -af 'chrome|chromium|whatsapp_sidecar' 2>/dev/null | SCRUB | head -15
+          echo "=== singleton locks ==="
+          find /opt/signal-flow/users -path '*/sessions/whatsapp/*' -name 'Singleton*' 2>/dev/null | head -20
+          echo "=== wa package ==="
+          node -p "try{require('/opt/signal-flow/app/whatsapp_sidecar/node_modules/whatsapp-web.js/package.json').version}catch(e){'missing'}" 2>/dev/null
+          echo "=== scrubbed log tails ==="
+          for L in /tmp/sf-ingest-run.log /tmp/sf-wa-ingest.log /tmp/sf-wa-link.log; do
+            echo "--- $L ---"
+            if [ -f "$L" ]; then
+              echo "bytes=$(stat -c%s "$L") mtime=$(date -u -r "$L" +%Y-%m-%dT%H:%M:%SZ)"
+              echo "event_types:"
+              grep -oE '"type":"[a-z_]+"' "$L" 2>/dev/null | sort | uniq -c | head -30
+              echo "event= lines:"
+              grep -E 'event=|error:|receive failed|incompatible|sidecar_|OOM|ENOSPC|No space|SingletonLock|deprecated_version|Evaluation failed|Native\.|loadLibrary' "$L" 2>/dev/null | SCRUB | tail -60
+              echo "tail:"
+              tail -n 40 "$L" | SCRUB
+            else
+              echo missing
+            fi
+          done
+          echo "DIAG_DUAL_END"
+          REMOTE
+          shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519
