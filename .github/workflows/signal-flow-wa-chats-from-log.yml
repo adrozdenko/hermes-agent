@@ -5,7 +5,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
-      - name: Parse chats from live sidecar log
+      - name: Parse chats from live sidecar log (opaque + alias hashes)
         env:
           SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
           HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
@@ -17,15 +17,37 @@ jobs:
           printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
           ssh -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 root@5.189.159.195 'bash -s' <<'REMOTE'
           set -euo pipefail
-          LOG=/tmp/sf-wa-link.log
-          PIDFILE=/tmp/sf-wa-sidecar.pid
-          if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then echo sidecar_running=1; else echo sidecar_running=0; fi
-          grep -oE '"type":"[a-z_]+"' "$LOG" 2>/dev/null | sort | uniq -c | head -20
-          python3 - <<'PY'
+          DATA_ROOT=/opt/signal-flow
+          APP="$DATA_ROOT/app"
+          SF="$APP/.venv/bin/sf-admin"
+          WAPID=/tmp/sf-wa-ingest.pid
+          if [ -f "$WAPID" ] && kill -0 "$(cat "$WAPID")" 2>/dev/null; then echo WA_INGEST=alive; else echo WA_INGEST=0; fi
+          if [ -f /tmp/sf-wa-sidecar.pid ] && kill -0 "$(cat /tmp/sf-wa-sidecar.pid)" 2>/dev/null; then echo sidecar_running=1; else echo sidecar_running=0; fi
+          # Prefer installed CLI (prints opaque primary + alias_ids hashes). Fallback keeps ops unblocked.
+          if [ -x "$SF" ] && "$SF" --data-root "$DATA_ROOT" --force-admin-cli wa-chats-from-log --help >/dev/null 2>&1; then
+            echo "via=sf-admin-wa-chats-from-log"
+            "$SF" --data-root "$DATA_ROOT" --force-admin-cli wa-chats-from-log
+          else
+            echo "via=inline_fallback HINT=install-signal-flow-app for alias dump"
+            python3 - <<'PY'
           import hashlib, json, re
           from pathlib import Path
-          log = Path("/tmp/sf-wa-link.log")
-          text = log.read_text(errors="replace") if log.exists() else ""
+          candidates = [
+              Path("/tmp/sf-wa-last-chats.ndjson"),
+              Path("/tmp/sf-wa-ingest.log"),
+              Path("/tmp/sf-wa-link.log"),
+          ]
+          text = ""
+          chosen = None
+          for log in candidates:
+              if not log.exists():
+                  continue
+              body = log.read_text(errors="replace")
+              if '"type":"chats"' in body or '"type": "chats"' in body:
+                  text, chosen = body, log
+                  break
+              if chosen is None:
+                  text, chosen = body, log
           chats = None
           for line in text.splitlines():
               line=line.strip()
@@ -46,6 +68,7 @@ jobs:
           if not chats:
               print("chats_n=0")
               print("HINT=no_chats_event_in_log")
+              print("LIST_DONE")
               raise SystemExit(0)
           print(f"chats_n={len(chats)}")
           vuha=[]
@@ -54,14 +77,26 @@ jobs:
               name=scrub(str(row.get("name") or ""))[:180]
               kind=str(row.get("kind") or "")[:40]
               key=opaque(str(row.get("id") or ""))
-              print(f"chat name={name!r} kind={kind!r} key={key!r}")
+              raw_aliases = row.get("alias_ids") or row.get("aliasIds") or []
+              aliases=[]
+              if isinstance(raw_aliases, list):
+                  for a in raw_aliases:
+                      ak=opaque(str(a or ""))
+                      if ak and ak != key and ak not in aliases:
+                          aliases.append(ak)
+              alias_repr="[" + ", ".join(repr(a) for a in aliases) + "]"
+              print(f"chat name={name!r} kind={kind!r} key={key!r} aliases={alias_repr}")
               fold=name.casefold()
               if "вуха" in fold or "vuha" in fold or "66" in name:
-                  vuha.append((name,key,kind))
+                  vuha.append((name,key,kind,aliases))
           print(f"VUHA_CANDIDATES_n={len(vuha)}")
-          for name,key,kind in vuha[:15]:
-              print(f"VUHA_HIT name={name!r} kind={kind!r} key={key!r}")
+          for name,key,kind,aliases in vuha[:15]:
+              alias_repr="[" + ", ".join(repr(a) for a in aliases) + "]"
+              print(f"VUHA_HIT name={name!r} kind={kind!r} key={key!r} aliases={alias_repr}")
           print("LIST_DONE")
+          if chosen:
+              print(f"log_path={chosen}")
           PY
+          fi
           REMOTE
           shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519
