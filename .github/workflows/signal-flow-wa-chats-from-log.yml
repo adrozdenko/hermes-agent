@@ -87,7 +87,8 @@ jobs:
               alias_repr="[" + ", ".join(repr(a) for a in aliases) + "]"
               print(f"chat name={name!r} kind={kind!r} key={key!r} aliases={alias_repr}")
               fold=name.casefold()
-              if "вуха" in fold or "vuha" in fold or "66" in name:
+              # «Вуха»/vuha only — bare "66" matched phone-named chats
+              if "вуха" in fold or "vuha" in fold:
                   vuha.append((name,key,kind,aliases))
           print(f"VUHA_CANDIDATES_n={len(vuha)}")
           for name,key,kind,aliases in vuha[:15]:
