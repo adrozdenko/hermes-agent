@@ -1,7 +1,8 @@
 name: Signal Flow disk cleanup (Contabo)
 
-# Safe: remove orphan /tmp/libsignal* extracts + journal vacuum leftovers.
-# Never deletes sessions, channels, QR, or SSH keys. Optional ingest restart.
+# Safe+fast: remove orphan /tmp/libsignal* extracts (signal-cli native jars),
+# optional journal vacuum, optional dual ingest restart.
+# Never deletes sessions/channels/QR/SSH keys.
 
 on:
   workflow_dispatch:
@@ -18,7 +19,7 @@ on:
 jobs:
   cleanup:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 10
     steps:
       - name: Free disk + optional restart
         env:
@@ -32,45 +33,36 @@ jobs:
           printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
-          ssh -o ConnectTimeout=30 -o ServerAliveInterval=20 \
+          ssh -o ConnectTimeout=30 -o ServerAliveInterval=15 -o ServerAliveCountMax=20 \
               -i ~/.ssh/id_ed25519 root@5.189.159.195 \
               "RESTART=$(printf %q "${RESTART:-true}") VACUUM=$(printf %q "${VACUUM:-true}") bash -s" <<'REMOTE'
           set -euo pipefail
           SCRUB() { sed -E 's/\+?[0-9]{8,15}/[tel]/g; /sgnl:\/\//d'; }
           echo "CLEANUP_BEGIN"
           echo "=== df before ==="
-          df -h / /tmp | head -5
-          echo "=== /tmp libsignal orphans ==="
-          ls -ld /tmp/libsignal* 2>/dev/null | wc -l | awk '{print "libsignal_dirs="$1}'
-          du -sh /tmp/libsignal* 2>/dev/null | awk '{s+=$1} END{print "note=see_du_lines"}' || true
-          du -ch /tmp/libsignal* 2>/dev/null | tail -1 || true
-          # Only remove clearly-named signal-cli native extract dirs
-          REMOVED=0
-          for d in /tmp/libsignal*; do
-            [ -e "$d" ] || continue
-            case "$d" in
-              /tmp/libsignal*) rm -rf "$d"; REMOVED=$((REMOVED+1)) ;;
-            esac
-          done
-          echo "libsignal_removed=$REMOVED"
-          # Other safe tmp clutter from our Contabo Actions
+          df -h / | head -2
+          # Count orphans quickly (no du of whole tree)
+          N=$(find /tmp -maxdepth 1 -type d -name 'libsignal*' 2>/dev/null | wc -l | tr -d ' ')
+          echo "libsignal_dirs_before=$N"
+          # Fast reclaim — do this BEFORE any vacuum/du
+          find /tmp -maxdepth 1 -type d -name 'libsignal*' -print0 2>/dev/null \
+            | xargs -0 -r rm -rf
           rm -f /tmp/signal-flow.tgz /tmp/sf-recv.log 2>/dev/null || true
-          # Puppeteer/chromium crashpads in /tmp (safe)
-          find /tmp -maxdepth 1 -type d \( -name '.org.chromium.Chromium.*' -o -name 'puppeteer_dev_chrome_profile*' -o -name 'chrome_crashpad*' \) -prune -exec rm -rf {} + 2>/dev/null || true
+          find /tmp -maxdepth 1 -type d \( -name '.org.chromium.Chromium.*' -o -name 'puppeteer_dev_chrome_profile*' -o -name 'chrome_crashpad*' \) -print0 2>/dev/null \
+            | xargs -0 -r rm -rf
+          N2=$(find /tmp -maxdepth 1 -type d -name 'libsignal*' 2>/dev/null | wc -l | tr -d ' ')
+          echo "libsignal_dirs_after=$N2"
+          echo "=== df after libsignal rm ==="
+          df -h / | head -2
           if [ "${VACUUM:-true}" = "true" ]; then
             echo "=== journal vacuum ==="
-            journalctl --vacuum-size=200M 2>&1 | tail -5 || true
+            timeout 60 journalctl --vacuum-size=200M 2>&1 | tail -5 || echo "journal_vacuum=timeout_or_skip"
           fi
-          echo "=== big dirs (bounded, scrubbed) ==="
-          du -xh --max-depth=1 /var/log /var/lib/docker /opt /tmp /home 2>/dev/null | sort -hr | head -25 | SCRUB || true
-          du -xh --max-depth=1 /opt/signal-flow 2>/dev/null | sort -hr | head -15 | SCRUB || true
-          echo "=== df after cleanup ==="
-          df -h / /tmp | head -5
-          AVAIL_K=$(df -Pk / | awk 'NR==2{print $4}')
-          echo "avail_kb=$AVAIL_K"
-          if [ "${AVAIL_K:-0}" -lt 500000 ]; then
-            echo "WARN: still under 500MB free — inspect docker/images/logs next"
-          fi
+          echo "=== df after vacuum ==="
+          df -h / | head -2
+          # Bounded size samples only (timeout-guarded)
+          echo "=== sample sizes ==="
+          timeout 20 du -sh /tmp /var/log /opt/signal-flow 2>/dev/null | SCRUB || true
 
           if [ "${RESTART:-true}" != "true" ]; then
             echo "RESTART_SKIPPED=1"
@@ -86,6 +78,8 @@ jobs:
           WAPID=/tmp/sf-wa-ingest.pid
           WALOG=/tmp/sf-wa-ingest.log
           BOTPID=/tmp/sf-bot-run.pid
+          LINKPID=/tmp/sf-wa-sidecar.pid
+          HTTPPID=/tmp/sf-wa-qr-http.pid
 
           echo "=== restart SIGNAL ingest ==="
           if [ -f "$PIDFILE" ]; then
@@ -94,7 +88,6 @@ jobs:
           fi
           pkill -f 'sf-admin.* ingest-run' 2>/dev/null || true
           pkill -f 'sf-admin.*bot-run' 2>/dev/null || true
-          # do NOT broad-pkill all signal-cli forever; ingest-start pattern:
           pkill -f 'signal-cli' 2>/dev/null || true
           sleep 2
           : >"$LOG"
@@ -109,19 +102,16 @@ jobs:
             echo "SIGNAL_INGEST=dead"
             SCRUB <"$LOG" | tail -30 || true
           fi
-          # Brief receive-health sample (scrubbed)
-          sleep 10
+          sleep 12
           if grep -q 'receive failed' "$LOG" 2>/dev/null; then
             echo "SIGNAL_RECEIVE=still_failing"
             grep -E 'receive failed|Native\.|ENOSPC|No space' "$LOG" | SCRUB | tail -15 || true
           else
             echo "SIGNAL_RECEIVE=no_fail_in_log_yet"
-            SCRUB <"$LOG" | tail -10 || true
+            SCRUB <"$LOG" | tail -12 || true
           fi
 
           echo "=== restart WA ingest ==="
-          LINKPID=/tmp/sf-wa-sidecar.pid
-          HTTPPID=/tmp/sf-wa-qr-http.pid
           if [ -f "$WAPID" ]; then
             OLD=$(cat "$WAPID" 2>/dev/null || true)
             [ -n "${OLD:-}" ] && kill -0 "$OLD" 2>/dev/null && kill "$OLD" 2>/dev/null || true
@@ -141,7 +131,7 @@ jobs:
           pkill -f 'whatsapp_sidecar/connector.js' 2>/dev/null || true
           sleep 2
           if [ ! -d "$APP/whatsapp_sidecar/node_modules/whatsapp-web.js" ]; then
-            echo "WA_NODE_MODULES_MISSING=1"
+            echo "WA_NODE_MODULES_MISSING=1 — npm ci"
             cd "$APP/whatsapp_sidecar"
             if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi
             cd /
@@ -172,7 +162,7 @@ jobs:
           done
           if [ "$READY" = 1 ]; then
             echo "WA_INGEST=alive pid=$(cat "$WAPID") ready=1"
-          elif kill -0 "$(cat "$WAPID")" 2>/dev/null; then
+          elif [ -f "$WAPID" ] && kill -0 "$(cat "$WAPID")" 2>/dev/null; then
             echo "WA_INGEST=alive_but_ready_unconfirmed pid=$(cat "$WAPID")"
             SCRUB <"$WALOG" | tail -20 || true
           else
