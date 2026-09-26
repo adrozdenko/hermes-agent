@@ -2,12 +2,18 @@ name: Signal Flow wa-live-qr (Contabo)
 # Start/restart WA sidecar + tiny HTTP page that auto-refreshes qr.png.
 # Operator opens URL on a computer, scans with phone WhatsApp Linked devices.
 # Manual only. Does not touch Signal ingest-run.
+# L3: refuses when /tmp/sf-wa-ingest.pid is alive (second connector). Prefer
+# signal-flow-wa-chats-from-log. Optional force_stop_wa_ingest stops WA ingest only.
 on:
   workflow_dispatch:
     inputs:
       clear_session:
         type: boolean
         default: true
+      force_stop_wa_ingest:
+        description: "Stop live wa-ingest before starting live QR sidecar (default refuse; prefer wa-chats-from-log)"
+        type: boolean
+        default: false
 jobs:
   live:
     runs-on: ubuntu-latest
@@ -18,6 +24,7 @@ jobs:
           SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
           HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
           CLEAR_SESSION: ${{ inputs.clear_session }}
+          FORCE_STOP_WA_INGEST: ${{ inputs.force_stop_wa_ingest }}
         run: |
           set -euo pipefail
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
@@ -25,8 +32,90 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
           ssh -o ConnectTimeout=30 -o ServerAliveInterval=20 -i ~/.ssh/id_ed25519 root@5.189.159.195 \
-            "CLEAR_SESSION=$(printf '%q' "${CLEAR_SESSION:-true}") bash -s" <<'REMOTE'
+            "CLEAR_SESSION=$(printf '%q' "${CLEAR_SESSION:-true}") FORCE_STOP_WA_INGEST=$(printf '%q' "${FORCE_STOP_WA_INGEST:-false}") bash -s" <<'REMOTE'
           set -euo pipefail
+          # L3: refuse second LocalAuth owner while Path B wa-ingest is alive.
+          # Default refuse → ops use signal-flow-wa-chats-from-log.
+          # force_stop_wa_ingest=true stops wa-ingest only (not Signal).
+          INGEST_PIDFILE=/tmp/sf-wa-ingest.pid
+          export FORCE_STOP_WA_INGEST="${FORCE_STOP_WA_INGEST:-false}"
+          export PYTHONPATH="/opt/signal-flow/app${PYTHONPATH:+:$PYTHONPATH}"
+          set +e
+          python3 - <<'L3PY'
+          import os, sys
+          from pathlib import Path
+
+          force = os.environ.get("FORCE_STOP_WA_INGEST", "false").strip().lower() in (
+              "1", "true", "yes",
+          )
+          try:
+              from sf.wa_ingest import wa_second_connector_preflight
+
+              r = wa_second_connector_preflight(force_stop=force)
+              print(r.message, flush=True)
+              raise SystemExit(0 if r.allowed else 3)
+          except ImportError:
+              pass
+
+          pidfile = Path("/tmp/sf-wa-ingest.pid")
+          pid = None
+          if pidfile.is_file():
+              try:
+                  raw = pidfile.read_text(encoding="utf-8").strip().splitlines()[0]
+                  pid = int(raw.strip())
+              except (OSError, ValueError, IndexError):
+                  pid = None
+          alive = False
+          if pid is not None and pid > 1:
+              try:
+                  os.kill(pid, 0)
+                  alive = True
+              except OSError:
+                  alive = False
+          if not alive:
+              print("WA_INGEST=not_running", flush=True)
+              raise SystemExit(0)
+          if force:
+              print("WA_INGEST_FORCE_STOP=1", flush=True)
+              try:
+                  os.kill(pid, 15)
+              except OSError:
+                  pass
+              import time
+              for _ in range(40):
+                  try:
+                      os.kill(pid, 0)
+                  except OSError:
+                      break
+                  time.sleep(0.25)
+              else:
+                  try:
+                      os.kill(pid, 9)
+                  except OSError:
+                      pass
+              try:
+                  pidfile.unlink(missing_ok=True)
+              except OSError:
+                  pass
+              raise SystemExit(0)
+          print(
+              "WA_INGEST_REFUSE=1 — use signal-flow-wa-chats-from-log "
+              "(or force_stop_wa_ingest=true)",
+              flush=True,
+          )
+          raise SystemExit(3)
+          L3PY
+          L3_RC=$?
+          set -e
+          if [ "$L3_RC" -eq 3 ]; then
+            echo "HINT=workflow_signal-flow-wa-chats-from-log" >&2
+            exit 3
+          fi
+          if [ "$L3_RC" -ne 0 ]; then
+            echo "L3_PREFLIGHT_ERROR rc=$L3_RC" >&2
+            exit "$L3_RC"
+          fi
+
           DATA_ROOT=/opt/signal-flow
           APP="$DATA_ROOT/app"
           SIDE="$APP/whatsapp_sidecar"
