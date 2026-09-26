@@ -1,9 +1,16 @@
 name: Signal Flow wa-select Вуха 66 (Contabo)
 
 # Almanac-style: channels.json whatsapp[] + sources + channels_include.
+# M2: optional opaque alias_keys (@g.us/@lid twins) — never raw JIDs in logs.
 # Does NOT kill ingest-run. Opaque key only (no phones/JIDs in logs).
+# Requires signal-flow app with upsert_whatsapp_channel (M2) installed on Contabo.
 on:
   workflow_dispatch:
+    inputs:
+      alias_keys:
+        description: "Optional opaque twin keys (comma-separated whatsapp:h_… only)"
+        required: false
+        default: ""
 
 jobs:
   select:
@@ -14,50 +21,49 @@ jobs:
         env:
           SSH_KEY: ${{ secrets.HERMES_SSH_KEY }}
           HOST_KEY: ${{ secrets.HERMES_HOST_KEY }}
+          ALIAS_KEYS_IN: ${{ inputs.alias_keys }}
         run: |
           set -euo pipefail
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
           printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
-          ssh -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 root@5.189.159.195 'bash -s' <<'REMOTE'
+          # Ship opaque aliases only (whatsapp:h_…) — never JIDs — as a temp env file.
+          ALIAS_CLEAN=$(printf '%s' "${ALIAS_KEYS_IN:-}" | tr ',' '\n' | sed '/^$/d' | grep -E '^whatsapp:h_[0-9a-f]+$' || true)
+          ALIAS_CSV=$(printf '%s' "$ALIAS_CLEAN" | paste -sd, - || true)
+          ssh -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 root@5.189.159.195 "ALIAS_KEYS_IN=$(printf '%q' "$ALIAS_CSV") bash -s" <<'REMOTE'
           set -euo pipefail
           export PYTHONUNBUFFERED=1
           /opt/signal-flow/app/.venv/bin/python -u - <<'PY'
-          import json, sys
+          import os, sys
           from pathlib import Path
-          from datetime import datetime, timezone
           sys.path.insert(0, "/opt/signal-flow/app")
-          from sf.flows import load_default_flow, save_default_flow, ensure_channels
+          from sf.flows import load_default_flow, save_default_flow, upsert_whatsapp_channel
           from sf.ingest import resolve_ingest_user
-          from sf.paths import channels_path
 
           VUHA_KEY = "whatsapp:h_7526e74533f40609390c"
           VUHA_NAME = "Вуха 66🦉"
           VUHA_KIND = "group"
 
+          aliases = [
+              p.strip()
+              for p in os.environ.get("ALIAS_KEYS_IN", "").split(",")
+              if p.strip().startswith("whatsapp:h_")
+          ]
+
           root = Path("/opt/signal-flow")
           signal_id, _ = resolve_ingest_user(root, "self")
-          data = ensure_channels(root, signal_id)
-          wa = data.get("whatsapp")
-          if not isinstance(wa, list):
-              wa = []
-              data["whatsapp"] = wa
-          found = False
-          for row in wa:
-              if isinstance(row, dict) and str(row.get("key") or "").strip() == VUHA_KEY:
-                  row["name"] = VUHA_NAME
-                  row["kind"] = VUHA_KIND
-                  found = True
-                  break
-          if not found:
-              wa.append({"key": VUHA_KEY, "name": VUHA_NAME, "kind": VUHA_KIND})
-          data["updated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-          path = channels_path(root, signal_id)
-          path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-          print(f"channels_whatsapp_n={len(wa)}", flush=True)
+          row = upsert_whatsapp_channel(
+              root,
+              signal_id,
+              key=VUHA_KEY,
+              name=VUHA_NAME,
+              kind=VUHA_KIND,
+              alias_keys=aliases or None,
+          )
           print(f"vuha_key={VUHA_KEY}", flush=True)
           print(f"vuha_name={VUHA_NAME}", flush=True)
+          print(f"alias_keys_n={len(row.get('alias_keys') or [])}", flush=True)
 
           flow = load_default_flow(root, signal_id)
           sources = [str(x) for x in (flow.get("sources") or []) if str(x).strip()]
