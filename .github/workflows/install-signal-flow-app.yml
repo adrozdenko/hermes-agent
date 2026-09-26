@@ -105,7 +105,8 @@ jobs:
 
           # Install/refresh systemd units (Restart=always) from app/scripts
           echo "=== systemd units install ==="
-          for u in signal-flow-ingest.service signal-flow-wa-ingest.service; do
+          for u in signal-flow-ingest.service signal-flow-wa-ingest.service \
+                   signal-flow-tmp-gc.service signal-flow-tmp-gc.timer; do
             if [ -f "$APP/scripts/$u" ]; then
               cp -f "$APP/scripts/$u" "/etc/systemd/system/$u"
               echo "UNIT_INSTALLED=$u"
@@ -114,6 +115,13 @@ jobs:
             fi
           done
           systemctl daemon-reload
+          # Ops GC: reclaim /tmp/libsignal* every 30min (never touches LocalAuth/sessions)
+          if [ -f /etc/systemd/system/signal-flow-tmp-gc.timer ]; then
+            systemctl enable --now signal-flow-tmp-gc.timer
+            systemctl start signal-flow-tmp-gc.service || true
+            echo "TMP_GC_TIMER=$(systemctl is-active signal-flow-tmp-gc.timer 2>/dev/null || echo unknown)"
+            systemctl list-timers --all 'signal-flow-tmp-gc*' 2>/dev/null | head -5 || true
+          fi
 
           # Stream state is outside app/ (bot-signal/stream.json) — must survive replace
           echo "=== stream state path check ==="
