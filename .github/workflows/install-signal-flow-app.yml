@@ -2,7 +2,8 @@ name: Install Signal Flow app (Contabo)
 
 # Clone private adrozdenko/signal-flow onto Contabo and pip-install sf-admin.
 # Manual only. Does not rebuild Hermes. Does not print secrets or admin id.
-# Install always restarts ingest-run; bot-run stays stopped.
+# Install always restarts Signal ingest-run; restores WA npm + wa-ingest-run when
+# whatsapp[] is configured or WA was alive pre-replace. Never starts bot-run.
 # Stream sinks live in bot-signal/stream.json under DATA_ROOT (outside app/), so
 # replacing app/ does not wipe default/arta/air; we verify after install.
 
@@ -12,7 +13,7 @@ on:
 jobs:
   install-app:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: Clone signal-flow with deploy key
         env:
@@ -50,17 +51,37 @@ jobs:
           PIDFILE=/tmp/sf-ingest-run.pid
           BOTPID=/tmp/sf-bot-run.pid
           LOG=/tmp/sf-ingest-run.log
+          WAPID=/tmp/sf-wa-ingest.pid
+          WALOG=/tmp/sf-wa-ingest.log
+          LINKPID=/tmp/sf-wa-sidecar.pid
+          HTTPPID=/tmp/sf-wa-qr-http.pid
+          PORT=18080
           test -d "$DATA_ROOT/config" || { echo "layout missing; run install-signal-flow-layout first" >&2; exit 1; }
-          # Release .venv file locks before replace (ingest / signal-cli hold them open)
-          for f in "$PIDFILE" "$BOTPID"; do
+
+          # H2: note WA liveness before replace (app/ wipe kills sidecar modules)
+          WA_WAS_ALIVE=0
+          if [ -f "$WAPID" ] && kill -0 "$(cat "$WAPID")" 2>/dev/null; then
+            WA_WAS_ALIVE=1
+          elif pgrep -af 'sf-admin.*wa-ingest-run' >/dev/null 2>&1; then
+            WA_WAS_ALIVE=1
+          fi
+          echo "WA_WAS_ALIVE=$WA_WAS_ALIVE"
+
+          # Release .venv / Chromium locks before replace
+          for f in "$PIDFILE" "$BOTPID" "$WAPID" "$LINKPID" "$HTTPPID"; do
             if [ -f "$f" ]; then
               OLD=$(cat "$f" 2>/dev/null || true)
               [ -n "${OLD:-}" ] && kill -0 "$OLD" 2>/dev/null && kill "$OLD" 2>/dev/null || true
+              rm -f "$f"
             fi
           done
           pkill -f 'sf-admin.* ingest-run' 2>/dev/null || true
+          pkill -f 'sf-admin.*wa-ingest-run' 2>/dev/null || true
           pkill -f 'sf-admin.*bot-run' 2>/dev/null || true
           pkill -f 'signal-cli' 2>/dev/null || true
+          pkill -f 'whatsapp_sidecar/connector.js' 2>/dev/null || true
+          pkill -f 'sf-wa-qr-www' 2>/dev/null || true
+          fuser -k "${PORT}/tcp" 2>/dev/null || true
           sleep 2
           tar -C "$DATA_ROOT" -xzf /tmp/signal-flow.tgz
           rm -rf "$APP"
@@ -108,7 +129,7 @@ jobs:
 
           # Same nohup/sf-admin flags as signal-flow-ingest-start.yml
           echo "=== ingest-start (post-install) ==="
-          # bot-run must stay stopped (ingest owns delivery)
+          # bot-run must stay stopped (ingest owns delivery); never start bot-run
           if [ -f "$BOTPID" ]; then
             OLD=$(cat "$BOTPID" 2>/dev/null || true)
             [ -n "${OLD:-}" ] && kill -0 "$OLD" 2>/dev/null && kill "$OLD" 2>/dev/null || true
@@ -121,17 +142,121 @@ jobs:
           sleep 2
           if kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
             echo INGEST_RUN=alive pid=$(cat "$PIDFILE")
+            echo SIGNAL_INGEST=alive pid=$(cat "$PIDFILE")
           else
             echo INGEST_RUN=dead
+            echo SIGNAL_INGEST=dead
             sed -E 's/\+?[0-9]{8,15}/[redacted]/g; /sgnl:\/\//d' "$LOG" | tail -n 30 || true
             exit 1
           fi
           echo BOT_RUN=stopped
           sed -E 's/\+?[0-9]{8,15}/[redacted]/g; /sgnl:\/\//d' "$LOG" | tail -n 15 || true
 
+          # H2: restore whatsapp_sidecar node_modules after app/ replace
+          echo "=== wa npm restore (post-install) ==="
+          SIDE="$APP/whatsapp_sidecar"
+          if [ -f "$SIDE/connector.js" ]; then
+            if [ ! -d "$SIDE/node_modules/whatsapp-web.js" ]; then
+              echo "WA_NODE_MODULES_MISSING=1 — running npm ci"
+              cd "$SIDE"
+              if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi
+              cd /
+            fi
+          else
+            echo "WA_CONNECTOR=missing (skip npm)"
+          fi
+          node_modules_ok=0
+          [ -f "$SIDE/connector.js" ] && [ -d "$SIDE/node_modules/whatsapp-web.js" ] && node_modules_ok=1
+          echo "node_modules_ok=$node_modules_ok"
+
+          # Restart wa-ingest if whatsapp[] configured OR WA was alive pre-replace
+          WA_CONFIGURED=0
+          WA_CONFIGURED=$(python3 - <<'PY'
+          import json
+          from pathlib import Path
+          root = Path("/opt/signal-flow/users")
+          configured = 0
+          if root.is_dir():
+              for ch in root.glob("*/channels.json"):
+                  try:
+                      data = json.loads(ch.read_text(encoding="utf-8"))
+                  except Exception:
+                      continue
+                  rows = data.get("whatsapp") or []
+                  if isinstance(rows, list) and any(
+                      isinstance(r, dict) and str(r.get("key") or "").strip() for r in rows
+                  ):
+                      configured = 1
+                      break
+          print(configured)
+          PY
+          )
+          echo "WA_CONFIGURED=$WA_CONFIGURED WA_WAS_ALIVE=$WA_WAS_ALIVE"
+
+          if [ "$WA_CONFIGURED" = 1 ] || [ "$WA_WAS_ALIVE" = 1 ]; then
+            echo "=== wa-ingest-start (post-install) ==="
+            if [ ! -f "$SIDE/connector.js" ]; then
+              echo "WA_INGEST=skipped_no_connector"
+            elif [ "$node_modules_ok" != 1 ]; then
+              echo "WA_INGEST=skipped_no_node_modules"
+            elif ! "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli wa-ingest-run --help >/dev/null 2>&1; then
+              echo "WA_INGEST=skipped_cli_missing"
+            else
+              # Patterns from signal-flow-wa-ingest-start.yml (ready wait, pidfile)
+              : >"$WALOG"
+              nohup env PYTHONUNBUFFERED=1 "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli \
+                wa-ingest-run self --receive-timeout 2 --idle-sleep 0.5 \
+                >"$WALOG" 2>&1 &
+              echo $! >"$WAPID"
+              READY=0
+              for i in $(seq 1 90); do
+                if ! kill -0 "$(cat "$WAPID")" 2>/dev/null; then
+                  echo "WA_INGEST=dead during ready wait"
+                  sed -E 's/\+?[0-9]{8,15}/[redacted]/g; s/[0-9]{6,}@(s\.whatsapp\.net|g\.us|lid|newsletter)/[redacted]/gi; /sgnl:\/\//d' "$WALOG" | tail -n 40 || true
+                  READY=0
+                  break
+                fi
+                if grep -qE 'event=sidecar_(ready|authenticated)' "$WALOG" 2>/dev/null \
+                   || grep -qE '"type":"(ready|authenticated)"' "$WALOG" 2>/dev/null; then
+                  READY=1
+                  break
+                fi
+                if grep -qE 'event=sidecar_qr|потребує QR|немає node_modules|Chromium/Chrome не знайдено' "$WALOG" 2>/dev/null; then
+                  echo "WA_INGEST=not_bonded_or_misconfigured"
+                  sed -E 's/\+?[0-9]{8,15}/[redacted]/g; s/[0-9]{6,}@(s\.whatsapp\.net|g\.us|lid|newsletter)/[redacted]/gi; /sgnl:\/\//d' "$WALOG" | tail -n 40 || true
+                  READY=0
+                  break
+                fi
+                sleep 1
+              done
+              if [ "$READY" = 1 ]; then
+                echo "WA_INGEST=alive pid=$(cat "$WAPID") ready=1"
+              elif [ -f "$WAPID" ] && kill -0 "$(cat "$WAPID")" 2>/dev/null; then
+                echo "WA_INGEST=alive_but_ready_unconfirmed pid=$(cat "$WAPID")"
+              else
+                echo "WA_INGEST=dead"
+                sed -E 's/\+?[0-9]{8,15}/[redacted]/g; s/[0-9]{6,}@(s\.whatsapp\.net|g\.us|lid|newsletter)/[redacted]/gi; /sgnl:\/\//d' "$WALOG" | tail -n 30 || true
+              fi
+            fi
+          else
+            echo "WA_INGEST=skipped_not_configured"
+          fi
+
+          # Final scrubbed status markers (phones/JIDs already filtered in log tails)
+          if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+            echo "SIGNAL_INGEST=alive pid=$(cat "$PIDFILE")"
+          else
+            echo "SIGNAL_INGEST=dead"
+          fi
+          if [ -f "$WAPID" ] && kill -0 "$(cat "$WAPID")" 2>/dev/null; then
+            echo "WA_INGEST=alive pid=$(cat "$WAPID")"
+          fi
+          echo "node_modules_ok=$node_modules_ok"
+          echo BOT_RUN=stopped
+
           echo "=== stream-status (post-install) ==="
           "$APP/.venv/bin/sf-admin" --data-root "$DATA_ROOT" --force-admin-cli stream-status
-          echo "install-signal-flow-app: done (ingest restored; bot-run stopped)"
+          echo "install-signal-flow-app: done (Signal+WA ingest restored when applicable; bot-run stopped)"
           ls -la "$DATA_ROOT" "$APP" | head -40
           REMOTE
           shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519
