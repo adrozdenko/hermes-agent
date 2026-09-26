@@ -23,7 +23,7 @@ jobs:
           printf '%s\n' "$HOST_KEY" >> ~/.ssh/known_hosts
           ssh -o ConnectTimeout=30 -i ~/.ssh/id_ed25519 root@5.189.159.195 'bash -s' <<'REMOTE'
           set +e
-          SCRUB() { sed -E 's/\+?[0-9]{8,15}/[tel]/g; s/[0-9]{6,}@(s\.whatsapp\.net|g\.us|lid|newsletter)/[jid]/gi; /sgnl:\/\//d; s/[A-Za-z0-9+\/]{40,}={0,2}/[b64]/g'; }
+          SCRUB() { sed -E 's/\+?[0-9]{8,15}/[tel]/g; s/[0-9]{6,}@(s\.whatsapp\.net|g\.us|lid|newsletter)/[jid]/gi; /sgnl:\/\//d; s/"text":"[^"]*"/"text":"[omitted]"/g; s/"qr_data_url":"[^"]*"/"qr_data_url":"[omitted]"/g'; }
           echo "DIAG_DUAL_BEGIN"
           echo "=== host ==="
           date -u +"utc=%Y-%m-%dT%H:%M:%SZ"
@@ -74,7 +74,12 @@ jobs:
               echo "event= lines:"
               grep -E 'event=|error:|receive failed|incompatible|sidecar_|OOM|ENOSPC|No space|SingletonLock|deprecated_version|Evaluation failed|Native\.|loadLibrary' "$L" 2>/dev/null | SCRUB | tail -60
               echo "tail:"
-              tail -n 40 "$L" | SCRUB
+              if [ "$L" = /tmp/sf-wa-link.log ]; then
+                # Event types + errors only — never dump chats/message bodies
+                grep -E '"type":"(error|auth_failure|disconnected|incompatible|qr|ready|authenticated)"|deprecated_version|Evaluation failed|SingletonLock' "$L" 2>/dev/null | SCRUB | tail -30 || true
+              else
+                tail -n 40 "$L" | SCRUB
+              fi
             else
               echo missing
             fi
